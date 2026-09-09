@@ -87,17 +87,174 @@ def parse_html(source: str) -> _Node:
 
 
 def query(root: _Node, selector: str) -> List[_Node]:
-    parsed = _parse_selector(selector)
+    groups: List[str] = _split_selector_groups(selector)
+    parsed_groups: List[List[_Selector]] = []
+    selector_errors: List[ValueError] = []
+
+    for part in groups:
+        try:
+            parsed_groups.append(_parse_selector(part))
+        except ValueError as exc:
+            selector_errors.append(exc)
+
+    if not parsed_groups:
+        if selector_errors or selector.strip():
+            return []
+        raise ValueError(f"Unsupported selector: {selector}")
+
     matches: List[_Node] = []
+    seen: set[int] = set()
 
-    def walk(node: _Node) -> None:
-        if _matches(node, parsed):
-            matches.append(node)
+    def walk(node: _Node, ancestors: List[_Node]) -> None:
+        for chain in parsed_groups:
+            if _matches_chain(node, chain, ancestors):
+                if id(node) not in seen:
+                    matches.append(node)
+                    seen.add(id(node))
+                break
         for child in node.children:
-            walk(child)
+            walk(child, ancestors + [node])
 
-    walk(root)
+    walk(root, [])
     return matches
+
+
+def _split_selector_tokens(selector: str) -> List[str]:
+    if not selector.strip():
+        return []
+
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    quote: Optional[str] = None
+    escaped = False
+
+    for ch in selector:
+        if escaped:
+            current.append(ch)
+            escaped = False
+            continue
+
+        if ch == "\\" and quote is not None:
+            current.append(ch)
+            escaped = True
+            continue
+
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            current.append(ch)
+            continue
+
+        if ch in {"'", '"'}:
+            quote = ch
+            current.append(ch)
+            continue
+
+        if ch == "[":
+            depth += 1
+            current.append(ch)
+            continue
+        if ch == "]":
+            if depth > 0:
+                depth -= 1
+            current.append(ch)
+            continue
+
+        if ch in {" ", "\t", "\n", "\r", "\f"}:
+            if depth == 0 and quote is None:
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                continue
+        if ch in {">", "+", "~"} and depth == 0 and quote is None:
+            raise ValueError(f"Unsupported selector: {selector}")
+
+        current.append(ch)
+
+    part = "".join(current).strip()
+    if part:
+        parts.append(part)
+    return parts
+
+
+def _split_selector_groups(selector: str) -> List[str]:
+    raw = selector.strip()
+    if not raw:
+        return []
+    if "," not in raw:
+        return [raw]
+
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    quote: Optional[str] = None
+    escaped = False
+
+    for ch in raw:
+        if escaped:
+            current.append(ch)
+            escaped = False
+            continue
+
+        if ch == "\\" and quote is not None:
+            current.append(ch)
+            escaped = True
+            continue
+
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            current.append(ch)
+            continue
+
+        if ch in {"'", '"'}:
+            quote = ch
+            current.append(ch)
+            continue
+
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            if depth > 0:
+                depth -= 1
+        elif ch == "," and depth == 0:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+
+        current.append(ch)
+
+    part = "".join(current).strip()
+    if part:
+        parts.append(part)
+    return parts
+
+
+def _parse_selector(selector: str) -> List[_Selector]:
+    parts = _split_selector_tokens(selector)
+    if not parts:
+        raise ValueError(f"Unsupported selector: {selector}")
+    return [_parse_simple_selector(part) for part in parts]
+
+
+def _matches_chain(node: _Node, selectors: List[_Selector], ancestors: List[_Node]) -> bool:
+    if not selectors:
+        return False
+    if not _matches(node, selectors[-1]):
+        return False
+    if len(selectors) == 1:
+        return True
+    need_index = len(selectors) - 2
+    for ancestor in reversed(ancestors):
+        if _matches(ancestor, selectors[need_index]):
+            need_index -= 1
+            if need_index < 0:
+                return True
+    return False
 
 
 def table_to_rows(table: _Node) -> List[Dict[str, str]]:
@@ -130,7 +287,7 @@ def table_to_rows(table: _Node) -> List[Dict[str, str]]:
     return rows
 
 
-def _parse_selector(selector: str) -> _Selector:
+def _parse_simple_selector(selector: str) -> _Selector:
     raw = selector.strip()
     if not raw:
         raise ValueError("Unsupported selector: empty")
