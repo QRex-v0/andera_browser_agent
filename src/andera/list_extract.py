@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlparse, unquote
 
 from andera.html_query import node_visible_text, parse_html, table_to_rows
@@ -41,6 +41,7 @@ class RawRecord:
     title: str
     url: str
     text: str
+    source_url: str = ""
     target_text: str = ""
     target_url: str = ""
     target_anchor: str = ""
@@ -71,18 +72,16 @@ def extract_schema_rows(
     mapped = _map_table_rows(table_columns or [], table_rows or [], columns, page_url)
     method = "table"
     if mapped is None:
-        mapped = [_project_record(record, columns) for record in records]
+        mapped, unmet = extract_schema_rows_from_records(
+            records,
+            page_url,
+            columns,
+            row_limit=row_limit,
+            status_filters=status_filters,
+            sort_spec=order,
+        )
         method = "list"
-        for record, row in zip(records, mapped):
-            row["_detail_url"] = record.url
-            row["_source_url"] = page_url
-            row["_item_text"] = record.text
-            row["_target_text"] = record.target_text
-            row["_target_url"] = record.target_url
-            row["_target_anchor"] = record.target_anchor
-            row["_ordinal"] = str(record.ordinal) if record.ordinal > 0 else ""
-            if order.kind == "time":
-                row["_sort_key"] = event_timestamp(record.text, order.key, times=record.times)
+        return columns, mapped, method, unmet
     elif order.kind == "time":
         for row in mapped:
             row["_sort_key"] = event_timestamp(
@@ -103,6 +102,93 @@ def extract_schema_rows(
     unmet = split_unmet_fields(public_rows(mapped, columns), columns)
     unmet.extend(item for item in sort_unmet if item not in unmet)
     return columns, mapped, method, unmet
+
+
+def extract_schema_rows_from_records(
+    records: Sequence[RawRecord],
+    page_url: str,
+    required_columns: Sequence[str],
+    row_limit: int = 0,
+    status_filters: Optional[Sequence[str]] = None,
+    sort_spec: Optional[SortSpec] = None,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    columns = [str(name) for name in required_columns if str(name)]
+    order = sort_spec or SortSpec()
+    mapped: List[Dict[str, str]] = []
+    for record in records:
+        row = _project_record(record, columns)
+        row["_detail_url"] = record.url
+        row["_source_url"] = record.source_url or page_url
+        row["_item_text"] = record.text
+        row["_target_text"] = record.target_text
+        row["_target_url"] = record.target_url
+        row["_target_anchor"] = record.target_anchor
+        row["_ordinal"] = str(record.ordinal) if record.ordinal > 0 else ""
+        if order.kind == "time":
+            row["_sort_key"] = event_timestamp(record.text, order.key, times=record.times)
+        mapped.append(row)
+    if status_filters:
+        mapped = _filter_status(mapped, status_filters)
+    mapped = [row for row in mapped if not _typed_url_is_invalid(row, columns)]
+    if order.kind == "time":
+        mapped, sort_unmet = apply_semantic_sort(mapped, order, row_limit)
+    else:
+        sort_unmet = []
+        if _should_select_ordinal_row(columns, row_limit, order):
+            mapped = _select_ordinal_row(mapped, row_limit)
+        elif row_limit > 0:
+            mapped = mapped[:row_limit]
+    unmet = split_unmet_fields(public_rows(mapped, columns), columns)
+    unmet.extend(item for item in sort_unmet if item not in unmet)
+    return mapped, unmet
+
+
+def collect_incremental_records(*args, **kwargs):
+    from andera.list_pagination import collect_incremental_records as _collect
+
+    return _collect(*args, **kwargs)
+
+
+def collect_incremental_schema_rows(
+    browser: Any,
+    html: str,
+    page_url: str,
+    required_columns: Sequence[str],
+    row_limit: int = 0,
+    status_filters: Optional[Sequence[str]] = None,
+    sort_spec: Optional[SortSpec] = None,
+    container_selector: str = "",
+    max_rounds: int = 8,
+    max_seconds: float = 20.0,
+) -> Tuple[List[str], List[Dict[str, str]], str, List[str], Any]:
+    columns = [str(name) for name in required_columns if str(name)]
+    order = sort_spec or SortSpec()
+    filters = [str(item).lower() for item in (status_filters or []) if str(item).strip()]
+
+    def accept(record: RawRecord) -> bool:
+        hay = record.text.lower()
+        return all(re.search(rf"\b{re.escape(token)}\b", hay) for token in filters)
+
+    target_count = row_limit if row_limit > 0 else 0
+    collection = collect_incremental_records(
+        browser,
+        target_count=target_count,
+        container_selector=container_selector,
+        page_url=page_url,
+        initial_html=html,
+        accept_record=accept if filters else None,
+        max_rounds=max_rounds,
+        max_seconds=max_seconds,
+    )
+    rows, unmet = extract_schema_rows_from_records(
+        collection.records,
+        page_url,
+        columns,
+        row_limit=row_limit,
+        status_filters=status_filters,
+        sort_spec=order,
+    )
+    return columns, rows, "list_incremental", unmet, collection
 
 
 def public_rows(rows: List[Dict[str, str]], columns: Sequence[str]) -> List[Dict[str, str]]:
@@ -219,10 +305,30 @@ def related_detail_link(html: str, page_url: str, column: str) -> str:
     return matches[0]["href"]
 
 
-def iter_raw_records(html: str, page_url: str) -> List[RawRecord]:
+def iter_raw_records(html: str, page_url: str, container_selector: str = "") -> List[RawRecord]:
     if not html:
         return []
     root = parse_html(html)
+    if container_selector:
+        try:
+            containers = query(root, container_selector)
+        except Exception:
+            containers = []
+        records: List[RawRecord] = []
+        seen = set()
+        for container in containers:
+            for record in _iter_raw_records_from_root(container, page_url, root):
+                key = (record.title, record.url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(record)
+        if records:
+            return records
+    return _iter_raw_records_from_root(root, page_url, root)
+
+
+def _iter_raw_records_from_root(root, page_url: str, document_root) -> List[RawRecord]:
     best_items: List = []
     best_parent = None
     best_score = 0.0
@@ -250,7 +356,7 @@ def iter_raw_records(html: str, page_url: str) -> List[RawRecord]:
     records: List[RawRecord] = []
     seen = set()
     for ordinal, window in enumerate(windows, start=1):
-        record = _record_from_window(window, page_url, root, ordinal)
+        record = _record_from_window(window, page_url, document_root, ordinal)
         if not record or not record.title or not record.url:
             continue
         key = (record.title, record.url, record.ordinal)
@@ -363,6 +469,7 @@ def _record_from_window(
         title=title_link["text"],
         url=title_link["href"],
         text=text,
+        source_url=page_url,
         target_text=target_text,
         target_url=target_url,
         target_anchor=target_anchor,
