@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from typing import Any, Dict, List
 
 from andera.html_query import parse_html, query, table_to_rows
@@ -68,7 +67,7 @@ def observation_from_html(url: str, html: str) -> Dict[str, Any]:
         if len(interactive) >= 60:
             break
     preview = preview_records(html, url)
-    content_links = list_content_index_candidates(html, url)[:8]
+    content_links = list_content_index_candidates(html, url)[:16]
     observed = {
         "url": url,
         "title": titles[0].text if titles else "",
@@ -87,22 +86,16 @@ def observation_from_html(url: str, html: str) -> Dict[str, Any]:
 
 
 def observation_digest(observation: Dict[str, Any]) -> str:
-    """Stable url + accessibility digest used to detect a stuck loop."""
+    """Stable page identity used to detect a stuck loop. Viewport chrome is ignored."""
     url = str(observation.get("url") or "")
-    a11y = observation.get("accessibility")
-    if a11y:
-        payload = json.dumps(a11y, sort_keys=True, default=str)[:4000]
-    else:
-        interactive = observation.get("interactive") or []
-        links = observation.get("content_index_links") or []
-        payload = "|".join(
-            [
-                str(observation.get("title") or ""),
-                str(observation.get("text_excerpt") or "")[:800],
-                ",".join(f"{item.get('text', '')}>{item.get('href', '')}" for item in interactive[:20]),
-                ",".join(f"{item.get('text', '')}>{item.get('href', '')}" for item in links[:8]),
-            ]
-        )
+    links = observation.get("content_index_links") or []
+    payload = "|".join(
+        [
+            str(observation.get("title") or ""),
+            str(observation.get("text_excerpt") or "")[:800],
+            ",".join(f"{item.get('text', '')}>{item.get('href', '')}" for item in links[:16]),
+        ]
+    )
     return hashlib.sha256(f"{url}\n{payload}".encode("utf-8", errors="replace")).hexdigest()
 
 

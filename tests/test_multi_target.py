@@ -75,6 +75,21 @@ class ScriptedBrowser:
             "devicePixelRatio": 1,
         }
 
+    def scroll(self) -> None:
+        return None
+
+    def scroll_to_end(self) -> None:
+        return None
+
+    def click(self, selector: str, match_text: str = "") -> None:
+        self.clicks = getattr(self, "clicks", 0) + 1
+        del selector, match_text
+
+    def resolve_href(self, selector: str, match_text: str = "") -> str:
+        from andera.executor import _href_from_html
+
+        return _href_from_html(self._html, selector, match_text, self._url)
+
     def reset(self) -> None:
         self._html = ""
         self._url = ""
@@ -178,8 +193,10 @@ def test_one_failed_target_does_not_fail_the_others(tmp_path: Path, out_dir: Pat
     by_name = {item["name"]: item for item in result.metadata["targets"]}
     assert by_name["Alpha"]["status"] == "success"
     assert by_name["Beta"]["status"] == "success"
-    assert by_name["Gamma"]["status"] == "failed"
+    assert by_name["Gamma"]["status"] == "partial"
+    assert "latest_content" in by_name["Gamma"]["unmet_requirements"]
     assert "content_index" in by_name["Gamma"]["unmet_requirements"]
+    assert len(by_name["Gamma"]["screenshots"]) == 1
     assert result.status != RunStatus.BLOCKED
 
 

@@ -65,10 +65,10 @@ Given the TaskSpec, compact DOM/accessibility observation, and prior actions, ch
 Prefer accessibility/DOM observations. If artifact_types includes screenshot, emit a screenshot action that honors screenshot_scope and the next missing screenshot_role before done_subgoal. Request an extra screenshot only if the page is visual, ambiguous, or not table-like.
 Choose only the next single action from the current observation. Do not emit a full script.
 If a required control is missing, wait once for asynchronously rendered content before concluding it is absent.
-If a newsroom, press, media, blog, or content index is required, follow a link that is visible in the observation. Do not invent a path.
+If a newsroom, press, media, blog, or content index is required, follow a link that is visible in the observation, including footer and menu links. Do not invent a path. If content_index_links names one, use that. If the destination URL is already known, emit navigate with that url — do not click a footer or in-page link just to reach it. If you cannot name the link from its visible text, report_failed — do not click a guess.
 report_blocked only when the site stopped us (authentication, 403, terms, captcha). If we can see the page but lack a way to proceed, report_failed.
 If the most recent item is required, rank dated items by parsed date, not document order. An item without a date is undated, not old. If no dated item exists after waiting, report_failed.
-Use generic locators (table, role, accessible name). Do not use site-specific hardcoded selectors.
+Identify an element by what it says, not by where it sits in the markup. A click, type, or select locator must name one element — role plus accessible name, or visible link/button text (for example a:has-text("Blog") or role=link[name="Newsroom"]). A bare tag name such as a, div, button, or span is not a locator and is not acceptable. Do not use site-specific CSS paths or nth-child guesses.
 Read-only: do not submit, approve, purchase, delete, or type into password fields.
 If list_candidates is nonempty, do not wait for a table; emit extract_table or extract_list.
 If the task requires a filtered subset such as merged or closed items, apply that filter using a visible control, search field, or matching href before extracting. Do not extract an unfiltered list.
@@ -295,7 +295,7 @@ class OpenAIPlanner:
                     args["role"] = missing
         if action_type == "navigate" and "url" not in args:
             args["url"] = spec.target_url
-        if action_type in {"wait", "extract_table", "click", "type", "select"} and "selector" not in args:
+        if action_type in {"wait", "extract_table"} and "selector" not in args:
             args["selector"] = spec.required_selector or "table"
         if action_type == "download":
             if "match_date" not in args:

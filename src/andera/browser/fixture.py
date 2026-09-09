@@ -76,13 +76,22 @@ class FixtureBrowser:
 
         return observation_from_html(self._url, self._html)
 
-    def click(self, selector: str) -> None:
+    def click(self, selector: str, match_text: str = "") -> None:
+        del selector, match_text
         return None
+
+    def resolve_href(self, selector: str, match_text: str = "") -> str:
+        from andera.executor import _href_from_html
+
+        return _href_from_html(self._html, selector, match_text, self._url)
 
     def type_text(self, selector: str, text: str) -> None:
         return None
 
     def scroll(self) -> None:
+        return None
+
+    def scroll_to_end(self) -> None:
         return None
 
     def environment(self) -> dict:
