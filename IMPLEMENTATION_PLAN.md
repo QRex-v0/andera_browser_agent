@@ -397,7 +397,7 @@ For changing websites, measure process and schema consistency within a recorded 
 
 1. Cursor opens the current vertical-slice PR. **Done:** https://github.com/QRex-v0/andera_browser_agent/pull/4
 2. Codex reviews it and establishes the baseline eval score. **Done for PR #4** (merged after P1/P2 fixes).
-3. Implement the visible task catalog and private-oracle evaluation protocol in [`evals/`](evals/README.md), beginning with deterministic fixture generation and strict artifact scoring.
+3. Implement the clean and adversarial matched-pair catalogs plus the private-oracle evaluation protocol in [`evals/`](evals/README.md), beginning with deterministic fixture generation and strict artifact scoring.
 4. Cursor implements the generic Playwright action loop.
 5. Codex implements or reviews verification and regression coverage.
 6. Iterate on visible failures until the release checkpoint.

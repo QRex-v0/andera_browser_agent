@@ -74,7 +74,7 @@ The suite covers:
 - Screenshot requested on the fixture backend (must be `partial`, not silent success)
 - Real Playwright Chromium collection of CSV + screenshot when the browser extra is installed
 
-The broader capability ladder and the machine-scoring contract live in [`evals/catalog.json`](evals/catalog.json) and [`evals/README.md`](evals/README.md). The catalog contains twelve visible development tasks across four difficulty levels. Gold answers belong in evaluator-only oracles, not in the agent's working tree.
+The broader capability ladder and the machine-scoring contract live in [`evals/catalog.json`](evals/catalog.json), [`evals/adversarial_catalog.json`](evals/adversarial_catalog.json), and [`evals/README.md`](evals/README.md). The catalogs contain twelve clean tasks across four difficulty levels and twenty matched adversarial cases. Gold answers belong in evaluator-only oracles, not in the agent's working tree.
 
 ## Design notes
 
