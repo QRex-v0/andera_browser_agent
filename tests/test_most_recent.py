@@ -63,6 +63,22 @@ def test_all_undated_does_not_pick_page_order() -> None:
     assert len(resolved.undated) >= 1
 
 
+def test_discovers_content_index_in_footer_and_aria_label() -> None:
+    html = """
+    <html><body>
+      <header><a href="/product">Product</a></header>
+      <main><p>Hero copy with no news links.</p></main>
+      <footer>
+        <a href="/legal/privacy">Privacy</a>
+        <a href="/blog" aria-label="Company blog"> </a>
+        <a href="/press">Press</a>
+      </footer>
+    </body></html>
+    """
+    href = discover_content_index(html, "https://corp.example/")
+    assert href in {"https://corp.example/blog", "https://corp.example/press"}
+
+
 def test_discovers_content_index_from_homepage_link() -> None:
     html = """
     <html><body>

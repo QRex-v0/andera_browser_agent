@@ -4,9 +4,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from andera.agent import EvidenceAgent
-from andera.models import BrowserAction, RunStatus
+from andera.executor import _click_destination, _href_from_html, _is_vague_locator
+from andera.models import BrowserAction, RunStatus, TaskSpec
 from andera.observe import observation_from_html
-from andera.planner import RulePlanner
+from andera.planner import DECIDE_INSTRUCTIONS, RulePlanner
 from andera.parse import parse_task
 from test_multi_target import ScriptedBrowser, _liveness_spec
 
@@ -59,16 +60,175 @@ def test_waits_for_async_newsroom_link(tmp_path: Path, out_dir: Path) -> None:
     assert len(shots) == 2
 
 
-def test_missing_newsroom_is_failed_not_blocked(tmp_path: Path, out_dir: Path) -> None:
+def test_missing_newsroom_keeps_homepage_screenshot(tmp_path: Path, out_dir: Path) -> None:
     spec, pages = _liveness_spec(
         tmp_path, ["Alpha", "Beta", "Gamma"], {"Alpha": False, "Beta": False, "Gamma": False}
     )
     single = replace(spec, targets=[spec.targets[0]], target_url=spec.targets[0].url)
     result = EvidenceAgent(ScriptedBrowser(pages), out_dir, planner=RulePlanner()).run(single)
-    assert result.status == RunStatus.FAILED
+    assert result.status == RunStatus.PARTIAL
     assert result.status != RunStatus.BLOCKED
-    assert any(issue.code == "failed" for issue in result.errors)
+    shots = [item for item in result.artifacts if item.type == "screenshot"]
+    assert len(shots) == 1
+    assert "homepage" in shots[0].description
+    assert "latest_content" in result.metadata.get("unmet_requirements", [])
     assert "content_index" in result.metadata.get("unmet_requirements", [])
+
+
+class ClickForeverPlanner:
+    name = "click-forever"
+
+    def plan(self, message: str, target_url: str | None = None, timeout_ms: int | None = None):
+        return parse_task(message, target_url=target_url, timeout_ms=timeout_ms)
+
+    def decide(self, spec, observation, trajectory, screenshot_note: str = ""):
+        if not any(event.action == "navigate" and event.outcome == "ok" for event in trajectory):
+            return BrowserAction("navigate", {"url": spec.target_url})
+        if not any(
+            event.action == "screenshot" and event.outcome == "ok" and event.args.get("role") == "homepage"
+            for event in trajectory
+        ):
+            return BrowserAction("screenshot", {"role": "homepage", "full_page": True})
+        return BrowserAction("click", {"selector": "a"})
+
+
+def test_bare_tag_click_is_rejected_and_homepage_is_kept(tmp_path: Path, out_dir: Path) -> None:
+    spec, pages = _liveness_spec(
+        tmp_path, ["Alpha", "Beta", "Gamma"], {"Alpha": False, "Beta": False, "Gamma": False}
+    )
+    home = spec.targets[0].url
+    browser = ScriptedBrowser(pages)
+    single = replace(spec, targets=[spec.targets[0]], target_url=home, step_budget=12)
+    result = EvidenceAgent(browser, out_dir, planner=ClickForeverPlanner()).run(single)
+    rejected = [event for event in result.trajectory if event.action == "click" and event.outcome == "rejected"]
+    assert rejected
+    assert all(event.args.get("reason") == "vague_locator" for event in rejected)
+    assert browser.current_url() == home or result.trajectory[0].args.get("url") == home
+    assert not any(event.action == "click" and event.outcome == "ok" for event in result.trajectory)
+    shots = [item for item in result.artifacts if item.type == "screenshot"]
+    assert len(shots) == 1
+    assert "homepage" in shots[0].description
+    assert result.status == RunStatus.PARTIAL
+    assert "latest_content" in result.metadata.get("unmet_requirements", [])
+
+
+def test_vague_locator_rejects_bare_tags_but_allows_named_controls() -> None:
+    assert _is_vague_locator(BrowserAction("click", {"selector": "a"}))
+    assert _is_vague_locator(BrowserAction("click", {"selector": "button"}))
+    assert _is_vague_locator(BrowserAction("click", {"selector": "div"}))
+    assert _is_vague_locator(BrowserAction("click", {"selector": "span"}))
+    assert _is_vague_locator(BrowserAction("click", {}))
+    assert not _is_vague_locator(BrowserAction("click", {"selector": "a", "match_text": "Blog"}))
+    assert not _is_vague_locator(BrowserAction("click", {"selector": 'a:has-text("Newsroom")'}))
+    assert not _is_vague_locator(BrowserAction("extract_table", {"selector": "table"}))
+    assert not _is_vague_locator(
+        BrowserAction("click", {"selector": 'a:has-text("What\'s New")', "url": "https://www.notion.com/releases"})
+    )
+    assert "bare tag name" in DECIDE_INSTRUCTIONS
+    assert "what it says" in DECIDE_INSTRUCTIONS
+
+
+def test_click_with_known_url_navigates_instead_of_clicking(tmp_path: Path, out_dir: Path) -> None:
+    home = (tmp_path / "home.html").resolve().as_uri()
+    releases = (tmp_path / "releases.html").resolve().as_uri()
+    (tmp_path / "home.html").write_text(
+        f'<html><body><h1>Home</h1><footer><a href="{releases}">What\'s New</a></footer></body></html>',
+        encoding="utf-8",
+    )
+    (tmp_path / "releases.html").write_text(
+        "<html><body><article><h1>Latest</h1><time datetime='2026-06-15'>Jun 15</time></article></body></html>",
+        encoding="utf-8",
+    )
+    pages = {home: (tmp_path / "home.html").read_text(encoding="utf-8"), releases: (tmp_path / "releases.html").read_text(encoding="utf-8")}
+    browser = ScriptedBrowser(pages)
+    browser.clicks = 0
+
+    class ClickKnownUrl:
+        name = "click-known-url"
+
+        def plan(self, message, target_url=None, timeout_ms=None):
+            return parse_task(message, target_url=target_url, timeout_ms=timeout_ms)
+
+        def decide(self, spec, observation, trajectory, screenshot_note=""):
+            if not any(event.action == "navigate" and event.outcome == "ok" for event in trajectory):
+                return BrowserAction("navigate", {"url": spec.target_url})
+            if not any(event.action == "screenshot" and event.args.get("role") == "homepage" for event in trajectory):
+                return BrowserAction("screenshot", {"role": "homepage", "full_page": True})
+            if not any(event.args.get("url") == releases or event.args.get("final_url") == releases for event in trajectory):
+                return BrowserAction(
+                    "click",
+                    {"selector": 'a:has-text("What\'s New")', "url": releases},
+                )
+            if not any(event.action == "screenshot" and event.args.get("role") == "latest_content" for event in trajectory):
+                return BrowserAction("screenshot", {"role": "latest_content", "full_page": True})
+            return BrowserAction("done_subgoal", {})
+
+    spec = replace(
+        parse_task("Take a screenshot of the website and the most recent content", target_url=home),
+        target_url=home,
+        artifact_types=["screenshot", "html_snapshot"],
+        screenshot_roles=["homepage", "latest_content"],
+        expect_rows=False,
+        required_columns=[],
+        step_budget=10,
+    )
+    result = EvidenceAgent(browser, out_dir, planner=ClickKnownUrl()).run(spec)
+    assert browser.clicks == 0
+    assert any(
+        event.action == "navigate" and event.args.get("url") == releases and event.args.get("from") == "click"
+        for event in result.trajectory
+    )
+    assert not any(event.action == "click" and event.outcome == "ok" for event in result.trajectory)
+    assert browser.current_url() == releases
+    shots = [item for item in result.artifacts if item.type == "screenshot"]
+    assert len(shots) == 2
+
+
+def test_href_from_footer_whats_new_is_resolved() -> None:
+    html = """
+    <html><body>
+      <header><a href="/product">Product</a></header>
+      <footer><a href="/releases">What's New</a></footer>
+    </body></html>
+    """
+    href = _href_from_html(html, 'a:has-text("What\'s New")', "", "https://www.notion.com/")
+    assert href == "https://www.notion.com/releases"
+
+
+def test_button_without_href_is_not_treated_as_navigation() -> None:
+    class Dummy:
+        def current_url(self):
+            return "https://corp.example/"
+
+    spec = TaskSpec(
+        raw="x",
+        intent="collect_evidence",
+        target_url="https://corp.example/",
+        required_selector="",
+        artifact_types=["html_snapshot"],
+    )
+    dest = _click_destination(
+        {"selector": 'button:has-text("Resources")'},
+        Dummy(),
+        spec,
+        '<html><body><button>Resources</button></body></html>',
+    )
+    assert dest == ""
+
+
+def test_repeated_digest_fails_stuck_and_keeps_homepage(tmp_path: Path, out_dir: Path) -> None:
+    spec, pages = _liveness_spec(
+        tmp_path, ["Alpha", "Beta", "Gamma"], {"Alpha": False, "Beta": False, "Gamma": False}
+    )
+    single = replace(spec, targets=[spec.targets[0]], target_url=spec.targets[0].url, step_budget=20)
+    result = EvidenceAgent(ScriptedBrowser(pages), out_dir, planner=ClickForeverPlanner()).run(single)
+    assert result.status == RunStatus.PARTIAL
+    assert any(event.action == "report_failed" and event.args.get("reason") == "stuck" for event in result.trajectory)
+    assert len(result.trajectory) < 12
+    shots = [item for item in result.artifacts if item.type == "screenshot"]
+    assert len(shots) == 1
+    assert "homepage" in shots[0].description
+    assert "latest_content" in result.metadata.get("unmet_requirements", [])
 
 
 def test_repeated_observation_does_not_spin(agent: EvidenceAgent, out_dir: Path) -> None:

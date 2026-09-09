@@ -99,8 +99,26 @@ class PlaywrightBrowser:
                 "devicePixelRatio": 1,
             }
 
-    def click(self, selector: str) -> None:
+    def click(self, selector: str, match_text: str = "") -> None:
+        if match_text:
+            target = self._page.locator(selector or "a, button").filter(has_text=match_text)
+            target.first.click(timeout=5000)
+            return
         self._page.click(selector, timeout=5000)
+
+    def resolve_href(self, selector: str, match_text: str = "") -> str:
+        locator = self._page.locator(selector or "a")
+        if match_text:
+            locator = locator.filter(has_text=match_text)
+        try:
+            href = locator.first.get_attribute("href", timeout=1500)
+        except Exception:
+            return ""
+        if not href:
+            return ""
+        from urllib.parse import urljoin
+
+        return urljoin(self._page.url, href)
 
     def download(
         self,
@@ -134,6 +152,13 @@ class PlaywrightBrowser:
 
     def scroll(self) -> None:
         self._page.mouse.wheel(0, 900)
+
+    def scroll_to_end(self) -> None:
+        try:
+            self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            self._page.wait_for_timeout(300)
+        except Exception:
+            self.scroll()
 
     def back(self) -> None:
         self._page.go_back()

@@ -83,7 +83,7 @@ def list_content_index_candidates(
     seen = set()
     for node in query(root, "a"):
         href = _absolutize(node.attrs.get("href", ""), page_url)
-        text = re.sub(r"\s+", " ", node_visible_text(node) or node.text or "").strip()
+        text = _anchor_label(node)
         if not href or href in seen:
             continue
         score = _index_score(text, href, page_url, tokens)
@@ -181,6 +181,16 @@ def _first_usable_link(node, page_url: str) -> Optional[Dict[str, str]]:
         if href and text:
             return {"text": text, "href": href}
     return None
+
+
+def _anchor_label(node) -> str:
+    parts = [
+        node_visible_text(node) or node.text or "",
+        node.attrs.get("aria-label", ""),
+        node.attrs.get("title", ""),
+        node.attrs.get("data-text", ""),
+    ]
+    return re.sub(r"\s+", " ", " ".join(part for part in parts if part)).strip()
 
 
 def _index_score(text: str, href: str, page_url: str, tokens: Sequence[str]) -> int:

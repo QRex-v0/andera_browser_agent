@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from andera.evidence import EvidenceStore, extract_table_schema
-from andera.html_query import parse_html, query
-from andera.content_index import discover_content_index, iter_content_items, resolve_most_recent
+from andera.html_query import node_visible_text, parse_html, query
+from andera.content_index import _absolutize, discover_content_index, iter_content_items, resolve_most_recent
 from andera.list_extract import (
     apply_semantic_sort,
     detail_values,
@@ -100,8 +100,9 @@ def execute(
     columns: List[str] = []
     extract_step = 0
     screenshot_note = ""
-    action_repeats: Dict[tuple, int] = {}
-    unstuck = False
+    digest_streak = 0
+    last_digest = ""
+    changed_strategy = False
     env = _environment(browser)
     requested_types = {str(item).lower() for item in spec.artifact_types}
     metadata: Dict[str, Any] = {
@@ -190,23 +191,37 @@ def execute(
                     status = worse_status(status, RunStatus.FAILED)
                     break
         screenshot_note = ""
-        signature = (digest, action.type)
-        action_repeats[signature] = action_repeats.get(signature, 0) + 1
-        if action_repeats[signature] >= 3:
-            if not unstuck and action.type != "scroll":
-                unstuck = True
-                action = BrowserAction("scroll", {})
-                record("checkpoint", {"reason": "loop_detected", "digest": digest}, "retry", html)
+        if action.type in _PROGRESS_ACTIONS:
+            digest_streak = 0
+            changed_strategy = False
+        elif digest and digest == last_digest:
+            digest_streak += 1
+        else:
+            digest_streak = 1
+            changed_strategy = False
+        last_digest = digest
+        if digest_streak >= 3:
+            if not changed_strategy and action.type != "scroll":
+                changed_strategy = True
+                action = _change_stuck_strategy(spec, observation, html, trajectory)
+                record("checkpoint", {"reason": "stuck", "digest": digest}, "retry", html)
             else:
-                errors.append(
-                    Issue("failed", "Observation loop detected; could not find another approach", retryable=False)
+                record("report_failed", {"reason": "stuck", "digest": digest}, "failed", html)
+                metadata["unmet_requirements"] = _merge_unmet(
+                    metadata, _secondary_unmet(spec, trajectory, "stuck")
                 )
-                record("report_failed", {"reason": "stuck_loop", "digest": digest}, "failed", html)
-                status = worse_status(status, RunStatus.FAILED)
+                errors.append(Issue("failed", "Stuck on a repeating observation", retryable=False))
+                status = worse_status(status, _keep_earned_homepage(spec, trajectory, RunStatus.FAILED))
+                _maybe_write_html(
+                    store, artifacts, html, spec, len(trajectory), browser=browser, trajectory=trajectory
+                )
                 break
         if not page_belongs_to_target(browser.current_url(), spec.target_url, trajectory):
             action = _require_target_navigation(action, spec)
         risk = classify_risk(action.type, " ".join(str(v) for v in action.args.values()))
+        if _is_vague_locator(action):
+            record(action.type, {**dict(action.args), "reason": "vague_locator"}, "rejected", html, risk)
+            continue
         if risk == ActionRisk.MUTATING.value and not spec.write_actions_allowed:
             record("report_blocked", {"reason": "mutating_action", "action": action.type}, "blocked", html, risk)
             errors.append(Issue("blocked", "Refusing a mutating browser action without write authorization", retryable=False))
@@ -473,6 +488,7 @@ def _apply_action(
 
     if action.type == "open_content_index":
         html = _ensure_page(browser, spec, record, risk, trajectory)
+        _call(browser, "scroll_to_end")
         _settle_browser(browser, min(remaining_ms or 4000, 4000))
         html = _safe_content(browser)
         kinds = args.get("kinds") if isinstance(args.get("kinds"), list) else None
@@ -486,10 +502,17 @@ def _apply_action(
                     retryable=False,
                 )
             )
-            metadata["unmet_requirements"] = list(
-                dict.fromkeys(list(metadata.get("unmet_requirements") or []) + ["content_index"])
+            metadata["unmet_requirements"] = _merge_unmet(
+                metadata, _secondary_unmet(spec, trajectory, "content_index")
             )
-            return RunStatus.FAILED, html, rows, columns, extract_step, screenshot_note
+            return (
+                _keep_earned_homepage(spec, trajectory, RunStatus.FAILED),
+                html,
+                rows,
+                columns,
+                extract_step,
+                screenshot_note,
+            )
         browser.goto(href)
         html = _safe_content(browser)
         record(
@@ -528,10 +551,17 @@ def _apply_action(
                     retryable=False,
                 )
             )
-            metadata["unmet_requirements"] = list(
-                dict.fromkeys(list(metadata.get("unmet_requirements") or []) + ["most_recent"])
+            metadata["unmet_requirements"] = _merge_unmet(
+                metadata, _secondary_unmet(spec, trajectory, "most_recent")
             )
-            return RunStatus.FAILED, html, rows, columns, extract_step, screenshot_note
+            return (
+                _keep_earned_homepage(spec, trajectory, RunStatus.FAILED),
+                html,
+                rows,
+                columns,
+                extract_step,
+                screenshot_note,
+            )
         browser.goto(resolved.item.url)
         html = _safe_content(browser)
         record(
@@ -640,9 +670,34 @@ def _apply_action(
         return status, html, rows, columns, extract_step, "downloaded_and_snapshot"
 
     if action.type == "click":
-        _call(browser, "click", selector)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
+        match_text = str(args.get("match_text") or "")
+        destination = _click_destination(args, browser, spec, html)
+        if destination:
+            browser.goto(destination)
+            html = _safe_content(browser)
+            record(
+                "navigate",
+                {
+                    "url": destination,
+                    "final_url": browser.current_url() or destination,
+                    "from": "click",
+                    "selector": selector,
+                    **({"match_text": match_text} if match_text else {}),
+                },
+                "ok",
+                html,
+                risk,
+            )
+            return status, html, rows, columns, extract_step, screenshot_note
+        click = getattr(browser, "click", None)
+        if callable(click):
+            try:
+                click(selector, match_text) if match_text else click(selector)
+            except TypeError:
+                click(selector)
         html = _safe_content(browser)
-        record("click", {"selector": selector}, "ok", html, risk)
+        record("click", {"selector": selector, **({"match_text": match_text} if match_text else {})}, "ok", html, risk)
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "type":
@@ -692,13 +747,20 @@ def _apply_action(
         reason = str(args.get("reason") or "Planner reported failed")
         record("report_failed", args, "failed", html, risk)
         errors.append(Issue("failed", reason, retryable=False))
-        metadata["unmet_requirements"] = list(
-            dict.fromkeys(list(metadata.get("unmet_requirements") or []) + _failed_requirement(reason))
+        metadata["unmet_requirements"] = _merge_unmet(
+            metadata, _secondary_unmet(spec, trajectory, reason)
         )
         _maybe_write_html(
             store, artifacts, html, spec, extract_step, browser=browser, trajectory=trajectory
         )
-        return worse_status(status, RunStatus.FAILED), html, rows, columns, extract_step, screenshot_note
+        return (
+            worse_status(status, _keep_earned_homepage(spec, trajectory, RunStatus.FAILED)),
+            html,
+            rows,
+            columns,
+            extract_step,
+            screenshot_note,
+        )
 
     if action.type == "done_subgoal":
         record("done_subgoal", {"status": status.value}, "ok", html, risk)
@@ -813,6 +875,23 @@ def _capture_screenshot(
         return status, "screenshot_unavailable"
 
 
+_PROGRESS_ACTIONS = {
+    "navigate",
+    "screenshot",
+    "extract_table",
+    "extract_list",
+    "extract_text",
+    "open_content_index",
+    "open_most_recent",
+    "download",
+    "done_subgoal",
+    "report_failed",
+    "report_blocked",
+    "type",
+    "select",
+}
+
+
 _SITE_STOP_TOKENS = (
     "authentication_required",
     "auth_wall",
@@ -841,7 +920,54 @@ def _failed_requirement(reason: str) -> List[str]:
         return ["content_index"]
     if "dated" in blob or "most_recent" in blob:
         return ["most_recent"]
+    if "stuck" in blob:
+        return ["stuck"]
     return []
+
+
+def _homepage_captured(trajectory: List[TrajectoryEvent]) -> bool:
+    return any(
+        event.action == "screenshot"
+        and event.outcome == "ok"
+        and str(event.args.get("role") or "") == "homepage"
+        for event in trajectory
+    )
+
+
+def _keep_earned_homepage(spec: TaskSpec, trajectory: List[TrajectoryEvent], stop: RunStatus) -> RunStatus:
+    if stop == RunStatus.FAILED and "latest_content" in spec.screenshot_roles and _homepage_captured(trajectory):
+        return RunStatus.PARTIAL
+    return stop
+
+
+def _secondary_unmet(spec: TaskSpec, trajectory: List[TrajectoryEvent], reason: str) -> List[str]:
+    unmet = _failed_requirement(reason)
+    if "latest_content" in spec.screenshot_roles and _homepage_captured(trajectory):
+        if "latest_content" not in unmet:
+            unmet.append("latest_content")
+    return unmet
+
+
+def _merge_unmet(metadata: Dict[str, Any], extra: List[str]) -> List[str]:
+    return list(dict.fromkeys(list(metadata.get("unmet_requirements") or []) + extra))
+
+
+def _change_stuck_strategy(
+    spec: TaskSpec,
+    observation: Dict[str, Any],
+    html: str,
+    trajectory: List[TrajectoryEvent],
+) -> BrowserAction:
+    opened_index = any(event.action == "open_content_index" and event.outcome == "ok" for event in trajectory)
+    if (
+        "latest_content" in spec.screenshot_roles
+        and _homepage_captured(trajectory)
+        and not opened_index
+    ):
+        page_url = str(observation.get("url") or spec.target_url)
+        if observation.get("content_index_links") or discover_content_index(html, page_url):
+            return BrowserAction("open_content_index", {})
+    return BrowserAction("scroll", {})
 
 
 def _requirements_satisfied(
@@ -1146,6 +1272,135 @@ def classify_risk(action_type: str, label: str = "") -> str:
     if action_type in {"click", "type", "select"}:
         return ActionRisk.UNKNOWN.value
     return ActionRisk.READ.value
+
+
+_BARE_TAG_SELECTORS = {
+    "a",
+    "div",
+    "button",
+    "span",
+    "p",
+    "li",
+    "ul",
+    "ol",
+    "nav",
+    "header",
+    "footer",
+    "section",
+    "article",
+    "main",
+    "aside",
+    "img",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "input",
+    "select",
+    "textarea",
+    "table",
+    "body",
+    "html",
+    "form",
+}
+
+
+def _is_bare_tag_selector(selector: str) -> bool:
+    raw = (selector or "").strip().lower()
+    return not raw or raw in _BARE_TAG_SELECTORS
+
+
+def _is_vague_locator(action: BrowserAction) -> bool:
+    if action.type not in {"click", "type", "select"}:
+        return False
+    if _is_navigable_href(str(action.args.get("url") or ""), ""):
+        return False
+    if str(action.args.get("match_text") or "").strip():
+        return False
+    if str(action.args.get("role") or "").strip() and str(
+        action.args.get("name") or action.args.get("text") or ""
+    ).strip():
+        return False
+    return _is_bare_tag_selector(str(action.args.get("selector") or ""))
+
+
+def _is_navigable_href(href: str, page_url: str = "") -> bool:
+    del page_url
+    raw = (href or "").strip()
+    if not raw or raw.startswith("#"):
+        return False
+    lowered = raw.lower()
+    return not lowered.startswith(("javascript:", "mailto:", "tel:", "data:"))
+
+
+def _label_from_selector(selector: str) -> str:
+    match = re.search(r":has-text\((.+)\)\s*$", selector or "", flags=re.I)
+    if match:
+        raw = match.group(1).strip()
+        if len(raw) >= 2 and raw[0] in {"'", '"'} and raw[-1] == raw[0]:
+            raw = raw[1:-1]
+        return raw.replace("\\'", "'").replace('\\"', '"')
+    for pattern in (
+        r'name\s*=\s*[\'"]([^\'"]+)[\'"]',
+        r'text\s*=\s*[\'"]([^\'"]+)[\'"]',
+    ):
+        match = re.search(pattern, selector or "", flags=re.I)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _href_from_html(html: str, selector: str, match_text: str, page_url: str) -> str:
+    if not html:
+        return ""
+    want = (match_text or _label_from_selector(selector) or "").strip().lower()
+    root = parse_html(html)
+    for node in query(root, "a"):
+        href = node.attrs.get("href", "")
+        if not _is_navigable_href(href):
+            continue
+        label = " ".join(
+            part
+            for part in (
+                node_visible_text(node),
+                node.attrs.get("aria-label", ""),
+                node.attrs.get("title", ""),
+            )
+            if part
+        ).strip()
+        if want and want not in label.lower() and want not in href.lower():
+            continue
+        if not want and selector and not _is_bare_tag_selector(selector):
+            continue
+        resolved = _absolutize(href, page_url)
+        if resolved:
+            return resolved
+    return ""
+
+
+def _click_destination(args: Dict[str, Any], browser: Any, spec: TaskSpec, html: str) -> str:
+    page_url = ""
+    try:
+        page_url = browser.current_url() or spec.target_url
+    except Exception:
+        page_url = spec.target_url
+    explicit = str(args.get("url") or "").strip()
+    if _is_navigable_href(explicit):
+        return _absolutize(explicit, page_url) or explicit
+    selector = str(args.get("selector") or "")
+    match_text = str(args.get("match_text") or "")
+    href = ""
+    resolver = getattr(browser, "resolve_href", None)
+    if callable(resolver):
+        try:
+            href = str(resolver(selector, match_text) or "")
+        except Exception:
+            href = ""
+    if not href:
+        href = _href_from_html(html, selector, match_text, page_url)
+    if _is_navigable_href(href):
+        return _absolutize(href, page_url) or href
+    return ""
 
 
 def _is_auth_wall(html: str, selector: str) -> bool:

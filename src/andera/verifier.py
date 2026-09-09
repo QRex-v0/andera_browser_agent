@@ -139,7 +139,7 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
         shots = [item for item in outcome.artifacts if item.type == "screenshot"]
         expected = len(spec.screenshot_roles) if spec.screenshot_roles else 1
         blocked = set((outcome.metadata or {}).get("unmet_requirements") or [])
-        if blocked & {"content_index", "most_recent"} and spec.screenshot_roles:
+        if blocked & {"content_index", "most_recent", "latest_content", "stuck"} and spec.screenshot_roles:
             expected = min(expected, 1)
         if len(shots) < expected:
             record(
