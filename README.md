@@ -24,21 +24,14 @@ Statuses are explicit: `success`, `partial`, `blocked`, `timeout`, or `failed`. 
 
 ## Setup
 
-Python 3.9+ is required. From the repo root:
+Python 3.9+ is required. The only supported setup is:
 
 ```bash
-python3 -m venv .venv
+make setup
 source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -e ".[dev]"
 ```
 
-Optional real-browser backend:
-
-```bash
-pip install -e ".[dev,browser]"
-playwright install chromium
-```
+That target creates `.venv`, installs the pinned dependencies from `requirements.txt` (`playwright==1.60.0`), and runs `playwright install chromium`. Do not install Playwright or Chromium by a separate ad-hoc command.
 
 ## Run
 
@@ -121,6 +114,6 @@ Some site-shaped knowledge is legitimate. Discovering an available API or learni
 
 - No live enterprise SSO, auth, or anti-bot handling.
 - Natural-language coverage is narrow (access-list collection plus explicit URL/selector/timeout phrases).
-- Playwright Chromium is covered by end-to-end tests when the `browser` extra is installed; fixture tests remain the default fast path.
+- Playwright Chromium is installed only via `make setup`; missing browsers fail fast and tell you to run that command.
 - One task per process; no queue, retry policy, or multi-page workflows yet.
 - Generalization CI, sealed holdout evaluation, and cold-start/warm-start comparison are design requirements above, not implemented in this first slice.

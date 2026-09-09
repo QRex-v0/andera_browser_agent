@@ -44,6 +44,9 @@ def test_playwright_collects_csv_and_screenshot(playwright_agent: EvidenceAgent)
     assert screenshot.sha256
     assert "Quarterly Access Review" in Path(html_artifact.path).read_text(encoding="utf-8")
     assert result.verifier["status"] == "success"
+    env = result.metadata["environment"]
+    assert env["version"]
+    assert Path(env["executable_path"]).exists()
 
 
 def test_playwright_access_list_is_reproducible(playwright_agent: EvidenceAgent, out_dir: Path) -> None:

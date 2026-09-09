@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+SETUP_COMMAND = "make setup"
+
+
 class PlaywrightBrowser:
-    """Pinned local Chromium session. Optional extra: pip install -e '.[browser]'."""
+    """Pinned local Chromium session. Install with `make setup`."""
 
     VIEWPORT = {"width": 1280, "height": 720}
     LOCALE = "en-US"
@@ -12,11 +17,29 @@ class PlaywrightBrowser:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise RuntimeError(
-                "Playwright is not installed. Run: pip install -e '.[browser]' && playwright install chromium"
+                f"Playwright is not installed. Run: {SETUP_COMMAND}"
             ) from exc
         self._playwright_cm = sync_playwright()
         self._playwright = self._playwright_cm.__enter__()
-        self._browser = self._playwright.chromium.launch(headless=headless)
+        self._executable_path = Path(self._playwright.chromium.executable_path)
+        if not self._executable_path.exists():
+            self._playwright_cm.__exit__(None, None, None)
+            raise RuntimeError(
+                f"Playwright Chromium executable not found at {self._executable_path}. "
+                f"Run: {SETUP_COMMAND}"
+            )
+        try:
+            self._browser = self._playwright.chromium.launch(headless=headless)
+        except Exception as exc:
+            self._playwright_cm.__exit__(None, None, None)
+            message = str(exc)
+            if "Executable doesn't exist" in message or "playwright install" in message.lower():
+                raise RuntimeError(
+                    f"Playwright Chromium is not installed. Run: {SETUP_COMMAND}"
+                ) from None
+            raise RuntimeError(
+                f"Failed to launch Playwright Chromium. Run: {SETUP_COMMAND}"
+            ) from None
         self._context = self._browser.new_context(
             viewport=self.VIEWPORT,
             locale=self.LOCALE,
@@ -70,6 +93,7 @@ class PlaywrightBrowser:
         return {
             "name": "playwright-chromium",
             "version": self._browser.version,
+            "executable_path": str(self._executable_path),
             "viewport": dict(self.VIEWPORT),
             "locale": self.LOCALE,
             "timezone": self.TIMEZONE,
