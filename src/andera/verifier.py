@@ -17,6 +17,8 @@ from andera.models import (
 )
 from andera.schema import column_type, is_absolute_http_url, parse_integer, split_unmet_fields
 
+_EVIDENCE_ARTIFACT_TYPES = {"screenshot", "html_snapshot", "csv", "download"}
+
 
 def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict] = None) -> VerifierReport:
     """Independent checks. May downgrade a status, never upgrade it."""
@@ -228,6 +230,24 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
         )
 
     for artifact in outcome.artifacts:
+        if artifact.type in _EVIDENCE_ARTIFACT_TYPES:
+            source = artifact.source_url or ""
+            origin_ok = artifact_origin_matches(source, spec.target_url)
+            record(
+                f"artifact_source:{artifact.type}",
+                origin_ok,
+                (
+                    f"{artifact.type} source host matches the target"
+                    if origin_ok
+                    else (
+                        f"{artifact.type} source_url host {origin_host(source)!r} "
+                        f"does not match target {origin_host(spec.target_url)!r}"
+                    )
+                ),
+                RunStatus.FAILED,
+            )
+
+    for artifact in outcome.artifacts:
         if artifact.type == "metadata":
             continue
         nonempty = artifact.bytes > 0 or (artifact.type == "csv" and not spec.expect_rows)
@@ -341,6 +361,25 @@ def hosts_equivalent(expected: str, actual: str) -> bool:
     if not expected_host and not actual_host:
         return expected_scheme == actual_scheme
     return expected_scheme == actual_scheme and expected_host == actual_host
+
+
+def origin_host(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def artifact_origin_matches(source_url: str, target_url: str) -> bool:
+    if not source_url or not target_url or source_url.startswith("about:"):
+        return False
+    source_host = origin_host(source_url)
+    target_host = origin_host(target_url)
+    if source_host or target_host:
+        return bool(target_host) and source_host == target_host
+    source_scheme = urlparse(source_url).scheme.lower()
+    target_scheme = urlparse(target_url).scheme.lower()
+    return source_scheme == target_scheme and source_scheme in {"file", "fixture"}
 
 
 def _host(url: str) -> str:

@@ -170,6 +170,23 @@ class PlaywrightBrowser:
     def current_url(self) -> str:
         return self._page.url
 
+    def reset(self) -> None:
+        try:
+            self._page.close()
+        except Exception:
+            pass
+        try:
+            self._context.close()
+        except Exception:
+            pass
+        self._context = self._browser.new_context(
+            viewport=self.VIEWPORT,
+            locale=self.LOCALE,
+            timezone_id=self.TIMEZONE,
+            user_agent=self.USER_AGENT,
+        )
+        self._page = self._context.new_page()
+
     def environment(self) -> dict:
         return {
             "name": "playwright-chromium",

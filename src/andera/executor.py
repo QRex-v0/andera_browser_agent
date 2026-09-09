@@ -35,6 +35,7 @@ from andera.schema import infer_sort_spec, infer_status_filters, split_unmet_fie
 from andera.observe import observation_digest, observation_from_html
 from andera.planner import Planner, RulePlanner, _missing_screenshot_role
 from andera.targets import listed_targets, target_slug
+from andera.verifier import artifact_origin_matches, hosts_equivalent, origin_host
 
 
 MUTATING_TOKENS = (
@@ -159,7 +160,15 @@ def execute(
         if remaining_ms() <= 0:
             errors.append(Issue("timeout", "Exceeded time budget", retryable=True))
             html = _safe_content(browser)
-            _maybe_write_html(store, artifacts, html, spec, trajectory[-1].step if trajectory else 0)
+            _maybe_write_html(
+                store,
+                artifacts,
+                html,
+                spec,
+                trajectory[-1].step if trajectory else 0,
+                browser=browser,
+                trajectory=trajectory,
+            )
             status = worse_status(status, RunStatus.TIMEOUT)
             break
 
@@ -195,11 +204,15 @@ def execute(
                 record("report_failed", {"reason": "stuck_loop", "digest": digest}, "failed", html)
                 status = worse_status(status, RunStatus.FAILED)
                 break
+        if not page_belongs_to_target(browser.current_url(), spec.target_url, trajectory):
+            action = _require_target_navigation(action, spec)
         risk = classify_risk(action.type, " ".join(str(v) for v in action.args.values()))
         if risk == ActionRisk.MUTATING.value and not spec.write_actions_allowed:
             record("report_blocked", {"reason": "mutating_action", "action": action.type}, "blocked", html, risk)
             errors.append(Issue("blocked", "Refusing a mutating browser action without write authorization", retryable=False))
-            _maybe_write_html(store, artifacts, html, spec, trajectory[-1].step)
+            _maybe_write_html(
+                store, artifacts, html, spec, trajectory[-1].step, browser=browser, trajectory=trajectory
+            )
             status = worse_status(status, RunStatus.BLOCKED)
             break
 
@@ -221,6 +234,7 @@ def execute(
                 remaining_ms=remaining_ms(),
                 risk=risk,
                 metadata=metadata,
+                trajectory=trajectory,
             )
         except FileNotFoundError as exc:
             record(action.type, action.args, "error", html, risk)
@@ -232,7 +246,15 @@ def execute(
             if _is_timeout(exc):
                 record(action.type, action.args, "timeout", html, risk)
                 errors.append(Issue("timeout", str(exc), retryable=True))
-                _maybe_write_html(store, artifacts, html, spec, trajectory[-1].step if trajectory else 0)
+                _maybe_write_html(
+                store,
+                artifacts,
+                html,
+                spec,
+                trajectory[-1].step if trajectory else 0,
+                browser=browser,
+                trajectory=trajectory,
+            )
                 status = worse_status(status, RunStatus.TIMEOUT)
                 break
             record(action.type, action.args, "error", html, risk)
@@ -274,11 +296,29 @@ def execute(
     ):
         selector = spec.required_selector or "table"
         columns, rows, extract_step, status = _extract(
-            browser, spec, store, artifacts, errors, record, html, selector, status, remaining_ms=remaining_ms()
+            browser,
+            spec,
+            store,
+            artifacts,
+            errors,
+            record,
+            html,
+            selector,
+            status,
+            remaining_ms=remaining_ms(),
+            trajectory=trajectory,
         )
 
     if html and not any(item.type == "html_snapshot" for item in artifacts):
-        _maybe_write_html(store, artifacts, html, spec, trajectory[-1].step if trajectory else 0)
+        _maybe_write_html(
+            store,
+            artifacts,
+            html,
+            spec,
+            trajectory[-1].step if trajectory else 0,
+            browser=browser,
+            trajectory=trajectory,
+        )
 
     while (
         "screenshot" in requested_types
@@ -308,8 +348,11 @@ def execute(
             risk=ActionRisk.READ.value,
             metadata=metadata,
             role=missing_role,
+            trajectory=trajectory,
         )
         if screenshot_note == "screenshot_unavailable":
+            break
+        if screenshot_note == "screenshot_rejected":
             break
 
     if status == RunStatus.SUCCESS and not artifacts:
@@ -358,6 +401,7 @@ def _apply_action(
     remaining_ms: int,
     risk: str,
     metadata: Dict[str, Any],
+    trajectory: List[TrajectoryEvent],
 ) -> tuple:
     args = dict(action.args)
     selector = str(args.get("selector") or spec.required_selector or "table")
@@ -377,19 +421,21 @@ def _apply_action(
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "inspect":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         record("inspect", {"selector": selector}, "ok", html, risk)
         if _is_auth_wall(html, spec.required_selector or selector):
             record("report_blocked", {"reason": "authentication_required"}, "blocked", html)
             errors.append(Issue("blocked", "Target requires authentication or a mutating action the executor cannot take", retryable=False))
-            _maybe_write_html(store, artifacts, html, spec, extract_step)
+            _maybe_write_html(
+                store, artifacts, html, spec, extract_step, browser=browser, trajectory=trajectory
+            )
             return RunStatus.BLOCKED, html, rows, columns, extract_step, screenshot_note
         if args.get("need_screenshot"):
             screenshot_note = "screenshot_requested"
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "wait":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         timeout_ms = int(args.get("timeout_ms") or min(remaining_ms or spec.timeout_ms, 8000) or 4000)
         if args.get("settle"):
             _settle_browser(browser, timeout_ms)
@@ -405,17 +451,28 @@ def _apply_action(
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type in {"extract_table", "extract_list"}:
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         if rows:
             record(action.type, {"skipped": "already_have_rows"}, "skipped", html, risk)
             return status, html, rows, columns, extract_step, screenshot_note
         columns, rows, extract_step, status = _extract(
-            browser, spec, store, artifacts, errors, record, html, selector, status, action.type, remaining_ms
+            browser,
+            spec,
+            store,
+            artifacts,
+            errors,
+            record,
+            html,
+            selector,
+            status,
+            action.type,
+            remaining_ms,
+            trajectory=trajectory,
         )
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "open_content_index":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         _settle_browser(browser, min(remaining_ms or 4000, 4000))
         html = _safe_content(browser)
         kinds = args.get("kinds") if isinstance(args.get("kinds"), list) else None
@@ -446,7 +503,7 @@ def _apply_action(
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "open_most_recent":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         _settle_browser(browser, min(remaining_ms or 4000, 4000))
         html = _safe_content(browser)
         page_url = browser.current_url() or spec.target_url
@@ -495,7 +552,7 @@ def _apply_action(
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "screenshot":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         status, screenshot_note = _capture_screenshot(
             browser=browser,
             spec=spec,
@@ -510,11 +567,12 @@ def _apply_action(
             metadata=metadata,
             full_page=args.get("full_page"),
             role=str(args.get("role") or ""),
+            trajectory=trajectory,
         )
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "download":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         method = getattr(browser, "download", None)
         if not callable(method):
             warnings.append(Issue("download_unavailable", "Browser backend does not support downloads", retryable=False))
@@ -547,13 +605,17 @@ def _apply_action(
         download_path = Path(downloaded)
         if not download_path.exists():
             raise FileNotFoundError(f"Download did not create a file at {downloaded}")
+        download_url = browser.current_url() or ""
+        if not page_belongs_to_target(download_url, spec.target_url, trajectory):
+            record("download", {"selector": selector, "reason": "wrong_host"}, "rejected", html, risk)
+            return status, html, rows, columns, extract_step, screenshot_note
         event = record("download", {"path": str(download_path), "selector": selector}, "ok", html, risk)
         artifacts.append(
             store.artifact_from_path(
                 "download",
                 download_path,
                 "Downloaded filing document",
-                source_url=browser.current_url() or spec.target_url,
+                source_url=download_url,
                 trajectory_step=event.step,
             )
         )
@@ -573,6 +635,7 @@ def _apply_action(
                 html=html,
                 risk=risk,
                 metadata=metadata,
+                trajectory=trajectory,
             )
         return status, html, rows, columns, extract_step, "downloaded_and_snapshot"
 
@@ -620,7 +683,9 @@ def _apply_action(
         stop = _site_stop_status(reason)
         record("report_blocked" if stop == RunStatus.BLOCKED else "report_failed", args, stop.value, html, risk)
         errors.append(Issue(stop.value, reason, retryable=False))
-        _maybe_write_html(store, artifacts, html, spec, extract_step)
+        _maybe_write_html(
+            store, artifacts, html, spec, extract_step, browser=browser, trajectory=trajectory
+        )
         return worse_status(status, stop), html, rows, columns, extract_step, screenshot_note
 
     if action.type == "report_failed":
@@ -630,7 +695,9 @@ def _apply_action(
         metadata["unmet_requirements"] = list(
             dict.fromkeys(list(metadata.get("unmet_requirements") or []) + _failed_requirement(reason))
         )
-        _maybe_write_html(store, artifacts, html, spec, extract_step)
+        _maybe_write_html(
+            store, artifacts, html, spec, extract_step, browser=browser, trajectory=trajectory
+        )
         return worse_status(status, RunStatus.FAILED), html, rows, columns, extract_step, screenshot_note
 
     if action.type == "done_subgoal":
@@ -656,6 +723,7 @@ def _capture_screenshot(
     metadata: Dict[str, Any],
     full_page: Any = None,
     role: str = "",
+    trajectory: Optional[List[TrajectoryEvent]] = None,
 ) -> tuple[RunStatus, str]:
     role = role or "final"
     existing = [
@@ -665,6 +733,26 @@ def _capture_screenshot(
     ]
     if existing:
         return status, "screenshot_captured"
+    current_url = ""
+    try:
+        current_url = browser.current_url() or ""
+    except Exception:
+        current_url = ""
+    if not page_belongs_to_target(current_url, spec.target_url, trajectory or []):
+        record(
+            "screenshot",
+            {
+                "role": role,
+                "url": current_url,
+                "reason": "wrong_host",
+                "target_host": origin_host(spec.target_url),
+                "page_host": origin_host(current_url),
+            },
+            "rejected",
+            html,
+            risk,
+        )
+        return status, "screenshot_rejected"
     use_full_page = spec.screenshot_scope != "viewport" if full_page is None else bool(full_page)
     target_name = listed_targets(spec)[0].name if listed_targets(spec) else ""
     filename = _screenshot_filename(target_name, role)
@@ -694,7 +782,7 @@ def _capture_screenshot(
                 "screenshot",
                 screenshot_path,
                 _screenshot_description(role, use_full_page),
-                source_url=browser.current_url() or spec.target_url,
+                source_url=current_url,
                 trajectory_step=event.step,
             )
         )
@@ -847,14 +935,24 @@ def _extract(
     status,
     action_name: str = "extract_table",
     remaining_ms: int = 0,
+    trajectory: Optional[List[TrajectoryEvent]] = None,
 ):
     page_url = ""
     try:
-        page_url = browser.current_url() or spec.target_url
+        page_url = browser.current_url() or ""
     except Exception:
-        page_url = spec.target_url
+        page_url = ""
     if not any(item.type == "html_snapshot" for item in artifacts) and html:
-        _maybe_write_html(store, artifacts, html, spec, 0, source_url=page_url)
+        _maybe_write_html(
+            store,
+            artifacts,
+            html,
+            spec,
+            0,
+            source_url=page_url,
+            browser=browser,
+            trajectory=trajectory or [],
+        )
     table_columns, table_rows = extract_table_schema(html, selector) if selector else ([], [])
     if not table_rows and selector not in {"", "table"}:
         table_columns, table_rows = extract_table_schema(html, "table")
@@ -906,7 +1004,7 @@ def _extract(
                 "evidence/extracted-table.csv",
                 csv_rows,
                 "Extracted table",
-                source_url=page_url or spec.target_url,
+                source_url=page_url,
                 trajectory_step=event.step,
                 fieldnames=columns,
             )
@@ -1071,8 +1169,18 @@ def _maybe_write_html(
     spec: TaskSpec,
     step: int,
     source_url: str = "",
+    browser: Any = None,
+    trajectory: Optional[List[TrajectoryEvent]] = None,
 ) -> None:
     if not html or any(item.type == "html_snapshot" for item in artifacts):
+        return
+    origin = source_url
+    if not origin and browser is not None:
+        try:
+            origin = browser.current_url() or ""
+        except Exception:
+            origin = ""
+    if not page_belongs_to_target(origin, spec.target_url, trajectory or []):
         return
     artifacts.append(
         store.write_text_artifact(
@@ -1080,19 +1188,25 @@ def _maybe_write_html(
             "evidence/page-final.html",
             html,
             "Page HTML captured at collection time",
-            source_url=source_url or spec.target_url,
+            source_url=origin,
             trajectory_step=step,
         )
     )
 
 
-def _ensure_page(browser: Any, spec: TaskSpec, record, risk: str) -> str:
+def _ensure_page(
+    browser: Any,
+    spec: TaskSpec,
+    record,
+    risk: str,
+    trajectory: Optional[List[TrajectoryEvent]] = None,
+) -> str:
     url = ""
     try:
         url = browser.current_url() or ""
     except Exception:
         url = ""
-    if url and not url.startswith("about:"):
+    if url and not url.startswith("about:") and hosts_equivalent(spec.target_url, url):
         html = _safe_content(browser)
         if html:
             return html
@@ -1106,6 +1220,45 @@ def _ensure_page(browser: Any, spec: TaskSpec, record, risk: str) -> str:
         risk,
     )
     return html
+
+
+def page_belongs_to_target(
+    current_url: str,
+    target_url: str,
+    trajectory: Optional[List[TrajectoryEvent]] = None,
+) -> bool:
+    if not artifact_origin_matches(current_url, target_url):
+        return False
+    if origin_host(target_url):
+        return True
+    events = trajectory or []
+    return any(
+        event.action == "navigate" and event.outcome == "ok" and _navigation_reaches_target(event, target_url)
+        for event in events
+    )
+
+
+def _navigation_reaches_target(event: TrajectoryEvent, target_url: str) -> bool:
+    requested = str(event.args.get("url") or "")
+    landed = str(event.args.get("final_url") or event.url or "")
+    target = (target_url or "").rstrip("/")
+    if requested.rstrip("/") == target or landed.rstrip("/") == target:
+        return True
+    if origin_host(target_url):
+        return artifact_origin_matches(requested, target_url) or artifact_origin_matches(landed, target_url)
+    return False
+
+
+def _require_target_navigation(action: BrowserAction, spec: TaskSpec) -> BrowserAction:
+    if action.type == "navigate":
+        dest = str(action.args.get("url") or spec.target_url)
+        target_host = origin_host(spec.target_url)
+        if target_host and origin_host(dest) and origin_host(dest) != target_host:
+            return BrowserAction("navigate", {"url": spec.target_url})
+        return action
+    if action.type in {"report_blocked", "report_failed"}:
+        return action
+    return BrowserAction("navigate", {"url": spec.target_url})
 
 
 def _environment(browser: Any) -> Dict[str, Any]:

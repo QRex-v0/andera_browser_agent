@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Dict
 
 from andera.agent import EvidenceAgent
-from andera.models import RunStatus, TargetSpec
+from andera.executor import execute
+from andera.evidence import EvidenceStore
+from andera.models import BrowserAction, RunStatus, TargetSpec
 from andera.parse import parse_task
 from andera.planner import OpenAIPlanner, RulePlanner
 from andera.schema import infer_named_targets
 from andera.targets import aggregate_target_statuses, official_homepage
+from andera.verifier import origin_host
 from test_planner import ScriptedClient, _plan_payload
 
 
@@ -71,9 +75,12 @@ class ScriptedBrowser:
             "devicePixelRatio": 1,
         }
 
-    def close(self) -> None:
+    def reset(self) -> None:
         self._html = ""
         self._url = ""
+
+    def close(self) -> None:
+        self.reset()
 
 
 def _company_pages(tmp_path: Path, name: str, *, newsroom: bool) -> Dict[str, str]:
@@ -183,6 +190,74 @@ def test_aggregate_status_keeps_mixed_outcomes() -> None:
     )
     assert aggregate_target_statuses([RunStatus.SUCCESS, RunStatus.SUCCESS]) == RunStatus.SUCCESS
     assert aggregate_target_statuses([RunStatus.BLOCKED, RunStatus.BLOCKED]) == RunStatus.BLOCKED
+
+
+class ScreenshotFirstPlanner:
+    name = "screenshot-first"
+
+    def plan(self, message: str, target_url: str | None = None, timeout_ms: int | None = None):
+        return parse_task(message, target_url=target_url, timeout_ms=timeout_ms)
+
+    def decide(self, spec, observation, trajectory, screenshot_note: str = ""):
+        if not any(event.action == "screenshot" and event.outcome == "ok" for event in trajectory):
+            return BrowserAction("screenshot", {"role": "homepage", "full_page": True})
+        return RulePlanner().decide(spec, observation, trajectory, screenshot_note=screenshot_note)
+
+
+class TrackingBrowser(ScriptedBrowser):
+    def __init__(self, pages: Dict[str, str]) -> None:
+        super().__init__(pages)
+        self.resets = 0
+
+    def reset(self) -> None:
+        self.resets += 1
+        super().reset()
+
+
+def test_stale_page_is_not_captured_for_the_next_target(tmp_path: Path, out_dir: Path) -> None:
+    wrong = "https://www.wrong.test/"
+    right = "https://www.right.test/"
+    pages = {
+        wrong: "<html><body><h1>Wrong company</h1></body></html>",
+        right: "<html><body><h1>Right company</h1></body></html>",
+    }
+    browser = ScriptedBrowser(pages)
+    browser.goto(wrong)
+    spec = replace(
+        parse_task("Take a screenshot of the website", target_url=right),
+        target_url=right,
+        artifact_types=["screenshot", "html_snapshot"],
+        screenshot_roles=["homepage"],
+        expect_rows=False,
+        required_columns=[],
+        timeout_ms=8000,
+        step_budget=8,
+    )
+    store = EvidenceStore(out_dir / "stale")
+    outcome = execute(
+        browser, spec, store, time.monotonic(), "2026-09-09T00:00:00+00:00", planner=ScreenshotFirstPlanner()
+    )
+    shots = [item for item in outcome.artifacts if item.type == "screenshot"]
+    assert shots
+    assert all(origin_host(item.source_url) == "right.test" for item in shots)
+    assert all(origin_host(item.source_url) != "wrong.test" for item in outcome.artifacts if item.source_url)
+    htmls = [item for item in outcome.artifacts if item.type == "html_snapshot"]
+    assert htmls
+    assert all(origin_host(item.source_url) == "right.test" for item in htmls)
+    assert not any(
+        event.action == "screenshot" and event.outcome == "ok" and origin_host(event.url) == "wrong.test"
+        for event in outcome.trajectory
+    )
+
+
+def test_multi_target_resets_browser_between_targets(tmp_path: Path, out_dir: Path) -> None:
+    spec, pages = _liveness_spec(
+        tmp_path, ["Alpha", "Beta", "Gamma"], {"Alpha": True, "Beta": True, "Gamma": True}
+    )
+    browser = TrackingBrowser(pages)
+    result = EvidenceAgent(browser, out_dir, planner=RulePlanner()).run(spec)
+    assert result.status == RunStatus.SUCCESS
+    assert browser.resets == 3
 
 
 def test_homepage_paths_are_not_kept_from_content_urls() -> None:

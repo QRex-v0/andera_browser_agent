@@ -94,9 +94,12 @@ class FixtureBrowser:
             "timezone": "UTC",
         }
 
-    def close(self) -> None:
+    def reset(self) -> None:
         self._html = ""
         self._url = ""
+
+    def close(self) -> None:
+        self.reset()
 
 
 def _url_to_path(url: str) -> Path:

@@ -212,6 +212,7 @@ def _execute_targets(
     step_offset = 0
 
     for target in targets:
+        _reset_browser(browser)
         child_spec = replace(spec, target_url=target.url, targets=[target])
         child_store = EvidenceStore(store.run_dir / "targets" / target_slug(target.name))
         outcome = execute(
@@ -314,6 +315,12 @@ def _execute_targets(
         "fields": fields,
     }
     return merged, report, provenance, summaries
+
+
+def _reset_browser(browser) -> None:
+    method = getattr(browser, "reset", None)
+    if callable(method):
+        method()
 
 
 def _write_result_json(path: Path, result: RunResult) -> str:
