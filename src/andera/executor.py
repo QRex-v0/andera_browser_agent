@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -49,6 +50,34 @@ MUTATING_TOKENS = (
     "upload",
 )
 
+_VERBOSE_URL_MAX = 72
+_VERBOSE_ARG_MAX = 72
+_VERBOSE_KEY_ARGS = {
+    "navigate": ("url",),
+    "download": ("path", "selector"),
+    "screenshot": ("role", "path"),
+}
+
+
+def _truncate_verbose(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _verbose_step(event: TrajectoryEvent) -> str:
+    url = _truncate_verbose(event.url or "", _VERBOSE_URL_MAX) or "-"
+    parts = [f"#{event.step}", event.action, event.outcome, url]
+    extra = ""
+    for key in _VERBOSE_KEY_ARGS.get(event.action, ()):
+        value = event.args.get(key)
+        if value:
+            extra = _truncate_verbose(str(value), _VERBOSE_ARG_MAX)
+            break
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
+
 
 def execute(
     browser: Any,
@@ -57,6 +86,7 @@ def execute(
     started: float,
     started_at: str,
     planner: Optional[Planner] = None,
+    verbose: bool = False,
 ) -> ExecutionOutcome:
     planner = planner or RulePlanner()
     artifacts: List[Artifact] = []
@@ -109,6 +139,8 @@ def execute(
         )
         trajectory.append(event)
         store.append_trace(event)
+        if verbose:
+            print(_verbose_step(event), file=sys.stderr, flush=True)
         return event
 
     def current_observation() -> Dict[str, Any]:

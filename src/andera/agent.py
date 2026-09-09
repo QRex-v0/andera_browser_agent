@@ -45,10 +45,17 @@ def create_browser(name: str) -> BrowserSession:
 class EvidenceAgent:
     """Run one evidence-collection task against a browser session."""
 
-    def __init__(self, browser: BrowserSession, out_dir: Path, planner: Planner | None = None) -> None:
+    def __init__(
+        self,
+        browser: BrowserSession,
+        out_dir: Path,
+        planner: Planner | None = None,
+        verbose: bool = False,
+    ) -> None:
         self.browser = browser
         self.out_dir = out_dir
         self.planner = planner or RulePlanner()
+        self.verbose = verbose
 
     def run(self, task: Union[EvidenceTask, str], target_url: str | None = None, timeout_ms: int | None = None) -> RunResult:
         parsed: TaskSpec = (
@@ -65,10 +72,25 @@ class EvidenceAgent:
         targets = listed_targets(parsed)
         if len(targets) > 1:
             outcome, verified, provenance, target_summaries = _execute_targets(
-                self.browser, parsed, store, started, started_at, self.planner, targets
+                self.browser,
+                parsed,
+                store,
+                started,
+                started_at,
+                self.planner,
+                targets,
+                verbose=self.verbose,
             )
         else:
-            outcome = execute(self.browser, parsed, store, started, started_at, planner=self.planner)
+            outcome = execute(
+                self.browser,
+                parsed,
+                store,
+                started,
+                started_at,
+                planner=self.planner,
+                verbose=self.verbose,
+            )
             provenance = build_provenance(parsed, outcome)
             verified = verify(parsed, outcome, provenance)
             target_summaries = []
@@ -173,6 +195,7 @@ def _execute_targets(
     started_at: str,
     planner: Planner,
     targets: List[TargetSpec],
+    verbose: bool = False,
 ) -> tuple[ExecutionOutcome, VerifierReport, Dict[str, Any], List[Dict[str, Any]]]:
     artifacts: List[Artifact] = []
     errors: List[Issue] = []
@@ -191,7 +214,9 @@ def _execute_targets(
     for target in targets:
         child_spec = replace(spec, target_url=target.url, targets=[target])
         child_store = EvidenceStore(store.run_dir / "targets" / target_slug(target.name))
-        outcome = execute(browser, child_spec, child_store, started, started_at, planner=planner)
+        outcome = execute(
+            browser, child_spec, child_store, started, started_at, planner=planner, verbose=verbose
+        )
         provenance = build_provenance(child_spec, outcome)
         verified = verify(child_spec, outcome, provenance)
         env = outcome.environment or env

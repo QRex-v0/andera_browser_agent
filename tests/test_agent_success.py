@@ -6,7 +6,8 @@ from pathlib import Path
 
 from andera.agent import EvidenceAgent
 from andera.cli import main
-from andera.models import RunStatus
+from andera.executor import _verbose_step
+from andera.models import RunStatus, TrajectoryEvent
 from andera.parse import parse_task
 from andera.paths import fixture_path
 
@@ -85,7 +86,7 @@ def test_collects_generic_table_from_another_fixture(agent: EvidenceAgent) -> No
     assert rows[0] == {"Item": "Laptop", "Qty": "4"}
 
 
-def test_cli_success(out_dir: Path) -> None:
+def test_cli_success(out_dir: Path, capsys) -> None:
     code = main(
         [
             "run",
@@ -102,3 +103,69 @@ def test_cli_success(out_dir: Path) -> None:
     result_files = list(out_dir.glob("*/result.json"))
     assert len(result_files) == 1
     assert json.loads(result_files[0].read_text(encoding="utf-8"))["status"] == "success"
+    captured = capsys.readouterr()
+    json.loads(captured.out)
+    assert "#1 " not in captured.err
+
+
+def test_verbose_step_is_one_compact_line() -> None:
+    navigate = TrajectoryEvent(
+        step=1,
+        timestamp="t",
+        action="navigate",
+        args={"url": "https://example.com/home"},
+        url="https://example.com/home",
+        observation_digest="",
+        outcome="ok",
+    )
+    assert _verbose_step(navigate) == "#1 navigate ok https://example.com/home https://example.com/home"
+
+    screenshot = TrajectoryEvent(
+        step=4,
+        timestamp="t",
+        action="screenshot",
+        args={"role": "homepage", "path": "/tmp/homepage.png"},
+        url="https://example.com/" + ("a" * 80),
+        observation_digest="",
+        outcome="ok",
+    )
+    line = _verbose_step(screenshot)
+    assert line.startswith("#4 screenshot ok https://example.com/")
+    assert line.endswith("homepage")
+    assert "\n" not in line
+    assert "..." in line
+
+    download = TrajectoryEvent(
+        step=2,
+        timestamp="t",
+        action="download",
+        args={"path": "/tmp/report.csv", "selector": "a.export"},
+        url="https://example.com/export",
+        observation_digest="",
+        outcome="ok",
+    )
+    assert _verbose_step(download) == "#2 download ok https://example.com/export /tmp/report.csv"
+
+
+def test_cli_verbose_prints_steps_to_stderr(out_dir: Path, capsys) -> None:
+    code = main(
+        [
+            "run",
+            "Collect the current user access list from the access review portal as CSV",
+            "--browser",
+            "fixture",
+            "--planner",
+            "rule",
+            "--out",
+            str(out_dir),
+            "--verbose",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["status"] == "success"
+    assert "#1 navigate" not in captured.out
+    assert "#1 navigate" in captured.err
+    assert "extract_table" in captured.err or "extract_list" in captured.err
+    assert all("\n" not in line for line in captured.err.strip().splitlines())

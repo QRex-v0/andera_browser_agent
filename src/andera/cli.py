@@ -23,6 +23,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--planner", choices=("openai", "rule"), default="openai")
     run.add_argument("--out", default="runs", help="Directory for artifacts and result.json")
     run.add_argument("--timeout-ms", type=int, default=None, help="Selector wait timeout")
+    run.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print each trajectory step to stderr as it happens",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -32,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         browser_name = args.browser or ("playwright" if args.planner == "openai" else "fixture")
         browser = create_browser(browser_name)
         try:
-            result = EvidenceAgent(browser, Path(args.out), planner=planner).run(
+            result = EvidenceAgent(browser, Path(args.out), planner=planner, verbose=args.verbose).run(
                 args.task, target_url=args.url, timeout_ms=args.timeout_ms
             )
         finally:
