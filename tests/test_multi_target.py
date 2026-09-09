@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 from andera.agent import EvidenceAgent
 from andera.executor import execute
@@ -31,16 +31,29 @@ def _png_bytes(width: int = 1280, height: int = 900) -> bytes:
 
 
 class ScriptedBrowser:
-    def __init__(self, pages: Dict[str, str]) -> None:
+    def __init__(
+        self,
+        pages: Dict[str, str],
+        statuses: Optional[Dict[str, int]] = None,
+        metrics_by_url: Optional[Dict[str, dict]] = None,
+        screenshot_sizes: Optional[Dict[str, Tuple[int, int]]] = None,
+    ) -> None:
         self.pages = pages
+        self.statuses = statuses or {}
+        self.metrics_by_url = metrics_by_url or {}
+        self.screenshot_sizes = screenshot_sizes or {}
+        self.loaded: List[str] = []
         self._url = ""
         self._html = ""
+        self._last_http_status = 0
 
     def goto(self, url: str) -> None:
+        self.loaded.append(url)
         if url not in self.pages:
             raise FileNotFoundError(url)
         self._url = url
         self._html = self.pages[url]
+        self._last_http_status = int(self.statuses.get(url, 0) or 0)
 
     def wait_for(self, selector: str, timeout_ms: int) -> None:
         return None
@@ -53,10 +66,18 @@ class ScriptedBrowser:
 
     def screenshot(self, path: str, full_page: bool = True) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_bytes(_png_bytes(1280, 900 if full_page else 720))
+        size = self.screenshot_sizes.get(self._url)
+        if size:
+            width, height = size
+        else:
+            width, height = 1280, (900 if full_page else 720)
+        Path(path).write_bytes(_png_bytes(width, height))
 
     def current_url(self) -> str:
         return self._url
+
+    def last_http_status(self) -> int:
+        return int(self._last_http_status or 0)
 
     def observe(self) -> dict:
         from andera.observe import observation_from_html
@@ -67,6 +88,8 @@ class ScriptedBrowser:
         return {"name": "scripted", "viewport": {"width": 1280, "height": 720}}
 
     def page_metrics(self) -> dict:
+        if self._url and self._url in self.metrics_by_url:
+            return dict(self.metrics_by_url[self._url])
         return {
             "viewportWidth": 1280,
             "viewportHeight": 720,
@@ -93,6 +116,7 @@ class ScriptedBrowser:
     def reset(self) -> None:
         self._html = ""
         self._url = ""
+        self._last_http_status = 0
 
     def close(self) -> None:
         self.reset()

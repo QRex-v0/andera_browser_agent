@@ -14,6 +14,7 @@ class FixtureBrowser:
     def __init__(self) -> None:
         self._html = ""
         self._url = ""
+        self._last_http_status = 0
 
     def goto(self, url: str) -> None:
         path = _url_to_path(url)
@@ -71,6 +72,9 @@ class FixtureBrowser:
     def current_url(self) -> str:
         return self._url
 
+    def last_http_status(self) -> int:
+        return int(self._last_http_status or 0)
+
     def observe(self) -> dict:
         from andera.observe import observation_from_html
 
@@ -106,6 +110,7 @@ class FixtureBrowser:
     def reset(self) -> None:
         self._html = ""
         self._url = ""
+        self._last_http_status = 0
 
     def close(self) -> None:
         self.reset()

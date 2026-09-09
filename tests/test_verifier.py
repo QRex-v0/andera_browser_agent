@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from andera.models import Artifact, ExecutionOutcome, RunStatus, TaskSpec
+from andera.models import Artifact, ExecutionOutcome, RunStatus, TaskSpec, TrajectoryEvent
 from andera.verifier import verify
 
 
@@ -305,6 +305,221 @@ def test_verifier_fails_when_artifact_host_does_not_match_target() -> None:
     assert report.status != RunStatus.PARTIAL
     assert any(check.code == "artifact_source:screenshot" and not check.passed for check in report.checks)
     assert any("notion.com" in check.message for check in report.checks if not check.passed)
+
+
+def test_screenshot_uses_per_artifact_metrics_not_run_scoped(tmp_path: Path) -> None:
+    home = tmp_path / "homepage.png"
+    latest = tmp_path / "latest.png"
+    home.write_bytes(_png_bytes(1280, 8592))
+    latest.write_bytes(_png_bytes(1280, 14560))
+    report = verify(
+        _spec(
+            artifact_types=["screenshot", "html_snapshot"],
+            expect_rows=False,
+            screenshot_scope="full_page",
+            screenshot_roles=["homepage", "latest_content"],
+        ),
+        _outcome(
+            html="<html>ok</html>",
+            artifacts=[
+                Artifact(
+                    type="html_snapshot",
+                    path="page.html",
+                    description="",
+                    bytes=12,
+                    sha256="ab",
+                    source_url="https://example.test/table",
+                ),
+                Artifact(
+                    type="screenshot",
+                    path=str(home),
+                    description="Full-page homepage screenshot",
+                    bytes=home.stat().st_size,
+                    sha256="cd",
+                    source_url="https://example.test/",
+                    page_metrics={
+                        "viewportWidth": 1280,
+                        "viewportHeight": 720,
+                        "scrollHeight": 8592,
+                        "devicePixelRatio": 1,
+                    },
+                ),
+                Artifact(
+                    type="screenshot",
+                    path=str(latest),
+                    description="Full-page latest content screenshot",
+                    bytes=latest.stat().st_size,
+                    sha256="ef",
+                    source_url="https://example.test/blog",
+                    page_metrics={
+                        "viewportWidth": 1280,
+                        "viewportHeight": 720,
+                        "scrollHeight": 14560,
+                        "devicePixelRatio": 1,
+                    },
+                ),
+            ],
+            environment={"viewport": {"width": 1280, "height": 720}},
+            metadata={
+                "screenshot_metrics": {
+                    "viewportWidth": 1280,
+                    "viewportHeight": 720,
+                    "scrollHeight": 14560,
+                    "devicePixelRatio": 1,
+                }
+            },
+        ),
+        provenance={"fields": []},
+    )
+    dim_checks = [check for check in report.checks if check.code == "screenshot_dimensions"]
+    assert dim_checks
+    assert all(check.passed for check in dim_checks)
+    assert not any(check.code == "screenshot_height_outlier" and not check.passed for check in report.checks)
+
+
+def test_short_screenshot_is_not_compared_to_a_later_page(tmp_path: Path) -> None:
+    path = tmp_path / "homepage.png"
+    path.write_bytes(_png_bytes(1280, 8592))
+    report = verify(
+        _spec(artifact_types=["screenshot"], expect_rows=False, screenshot_scope="full_page"),
+        _outcome(
+            html="<html>ok</html>",
+            artifacts=[
+                Artifact(
+                    type="screenshot",
+                    path=str(path),
+                    description="Full-page homepage screenshot",
+                    bytes=path.stat().st_size,
+                    sha256="cd",
+                    source_url="https://example.test/",
+                    page_metrics={
+                        "viewportWidth": 1280,
+                        "viewportHeight": 720,
+                        "scrollHeight": 8592,
+                        "devicePixelRatio": 1,
+                    },
+                )
+            ],
+            environment={"viewport": {"width": 1280, "height": 720}},
+            metadata={
+                "screenshot_metrics": {
+                    "viewportWidth": 1280,
+                    "viewportHeight": 720,
+                    "scrollHeight": 14560,
+                    "devicePixelRatio": 1,
+                }
+            },
+        ),
+        provenance={"fields": []},
+    )
+    assert any(check.code == "screenshot_dimensions" and check.passed for check in report.checks)
+    assert report.status != RunStatus.FAILED or all(
+        check.passed for check in report.checks if check.code == "screenshot_dimensions"
+    )
+
+
+def test_screenshot_height_outlier_is_flagged(tmp_path: Path) -> None:
+    tall = tmp_path / "homepage.png"
+    short = tmp_path / "latest.png"
+    tall.write_bytes(_png_bytes(1280, 8592))
+    short.write_bytes(_png_bytes(1280, 1004))
+    report = verify(
+        _spec(
+            artifact_types=["screenshot", "html_snapshot"],
+            expect_rows=False,
+            screenshot_scope="full_page",
+            screenshot_roles=["homepage", "latest_content"],
+        ),
+        _outcome(
+            html="<html>ok</html>",
+            artifacts=[
+                Artifact(
+                    type="html_snapshot",
+                    path="page.html",
+                    description="",
+                    bytes=12,
+                    sha256="ab",
+                    source_url="https://example.test/",
+                ),
+                Artifact(
+                    type="screenshot",
+                    path=str(tall),
+                    description="Full-page homepage screenshot",
+                    bytes=tall.stat().st_size,
+                    sha256="cd",
+                    source_url="https://example.test/",
+                    page_metrics={"viewportWidth": 1280, "viewportHeight": 720, "scrollHeight": 8592},
+                ),
+                Artifact(
+                    type="screenshot",
+                    path=str(short),
+                    description="Full-page latest content screenshot",
+                    bytes=short.stat().st_size,
+                    sha256="ef",
+                    source_url="https://example.test/missing",
+                    page_metrics={"viewportWidth": 1280, "viewportHeight": 720, "scrollHeight": 1004},
+                ),
+            ],
+            environment={"viewport": {"width": 1280, "height": 720}},
+        ),
+        provenance={"fields": []},
+    )
+    assert report.status == RunStatus.PARTIAL
+    assert any(check.code == "screenshot_height_outlier" and not check.passed for check in report.checks)
+    assert "screenshot_height_outlier" in report.unmet_requirements
+
+
+def test_verifier_rejects_error_page_artifacts() -> None:
+    report = verify(
+        _spec(
+            artifact_types=["screenshot", "html_snapshot"],
+            expect_rows=False,
+            screenshot_roles=["homepage", "latest_content"],
+        ),
+        _outcome(
+            provisional_status=RunStatus.SUCCESS,
+            html="<html><title>Page not found</title><h1>Page not found</h1></html>",
+            artifacts=[
+                _artifact(
+                    "html_snapshot",
+                    source_url="https://example.test/missing",
+                    path="page.html",
+                    bytes=40,
+                    sha256="aa",
+                    error_page=True,
+                    http_status=404,
+                ),
+                _artifact(
+                    "screenshot",
+                    source_url="https://example.test/missing",
+                    path="latest.png",
+                    description="latest content screenshot",
+                    bytes=64,
+                    sha256="bb",
+                    error_page=True,
+                    http_status=404,
+                ),
+            ],
+            metadata={"error_page_urls": ["https://example.test/missing"], "unmet_requirements": ["not_found"]},
+            trajectory=[
+                TrajectoryEvent(
+                    step=1,
+                    timestamp="2026-09-09T00:00:00+00:00",
+                    action="navigate",
+                    args={"url": "https://example.test/missing", "final_url": "https://example.test/missing", "error_page": "not_found", "http_status": 404},
+                    url="https://example.test/missing",
+                    observation_digest="",
+                    outcome="ok",
+                )
+            ],
+        ),
+        provenance={"fields": []},
+    )
+    assert report.status != RunStatus.SUCCESS
+    assert report.status == RunStatus.PARTIAL
+    assert any(check.code == "error_page" and not check.passed for check in report.checks)
+    assert "not_found" in report.unmet_requirements
+    assert any(check.code == "artifact_source:screenshot" and check.passed for check in report.checks)
 
 
 def test_verifier_never_upgrades_timeout() -> None:

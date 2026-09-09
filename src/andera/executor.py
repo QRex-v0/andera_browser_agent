@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, unquote_plus, urlparse
 
 from andera.evidence import EvidenceStore, extract_table_schema, extract_visible_text, sha256_hex
 from andera.html_query import node_visible_text, parse_html, query
@@ -236,6 +236,16 @@ def execute(
         if _is_vague_locator(action):
             record(action.type, {**dict(action.args), "reason": "vague_locator"}, "rejected", html, risk)
             continue
+        invalid_url = _invalid_url_action_reason(action, spec)
+        if invalid_url:
+            record(
+                action.type,
+                {**dict(action.args), "reason": invalid_url},
+                "rejected",
+                html,
+                risk,
+            )
+            continue
         if risk == ActionRisk.MUTATING.value and not spec.write_actions_allowed:
             record("report_blocked", {"reason": "mutating_action", "action": action.type}, "blocked", html, risk)
             errors.append(Issue("blocked", "Refusing a mutating browser action without write authorization", retryable=False))
@@ -443,29 +453,26 @@ def _apply_action(
         if focus is not None:
             focus.pop("inspect", None)
         requested = str(args.get("url") or spec.target_url)
+        refused = _invalid_url_reason(requested)
+        if refused:
+            record("navigate", {"url": requested, "reason": refused}, "rejected", html, risk)
+            return status, html, rows, columns, extract_step, screenshot_note
         browser.goto(requested)
         html = _await_rendered_page(browser, spec, remaining_ms, selector)
-        final_url = ""
-        try:
-            final_url = browser.current_url() or requested
-        except Exception:
-            final_url = requested
-        record(
-            "navigate",
-            {"url": requested, "final_url": final_url},
-            "ok",
-            html,
-            risk,
+        status, html = _finish_navigation(
+            browser=browser,
+            spec=spec,
+            requested=requested,
+            html=html,
+            record=record,
+            risk=risk,
+            metadata=metadata,
+            errors=errors,
+            status=status,
+            trajectory=trajectory,
         )
-        if _is_site_stop_page(html, spec.required_selector, final_url):
-            reason = (
-                "authentication_required"
-                if _is_auth_wall(html, spec.required_selector, final_url)
-                else "site_policy"
-            )
-            record("report_blocked", {"reason": reason}, "blocked", html, risk)
-            errors.append(Issue("blocked", _blocked_message(reason), retryable=False))
-            return RunStatus.BLOCKED, html, rows, columns, extract_step, screenshot_note
+        if status == RunStatus.BLOCKED:
+            return status, html, rows, columns, extract_step, screenshot_note
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "inspect":
@@ -571,14 +578,27 @@ def _apply_action(
             )
         browser.goto(href)
         html = _safe_content(browser)
+        final_url = browser.current_url() or href
+        http_status = _last_http_status(browser)
+        error_kind = _error_page_kind(html, http_status)
         record(
             "open_content_index",
-            {"url": href, "final_url": browser.current_url() or href},
+            {
+                "url": href,
+                "final_url": final_url,
+                **({"http_status": http_status} if http_status else {}),
+                **({"error_page": error_kind} if error_kind else {}),
+            },
             "ok",
             html,
             risk,
         )
-        metadata["content_index_url"] = browser.current_url() or href
+        if error_kind:
+            _remember_error_page(metadata, spec, trajectory, error_kind, final_url)
+            errors.append(Issue(error_kind, f"Content index landed on an error page ({error_kind})", retryable=False))
+            status = worse_status(status, _keep_earned_homepage(spec, trajectory, RunStatus.FAILED))
+            return status, html, rows, columns, extract_step, screenshot_note
+        metadata["content_index_url"] = final_url
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "open_most_recent":
@@ -634,22 +654,32 @@ def _apply_action(
             )
         browser.goto(resolved.item.url)
         html = _safe_content(browser)
+        final_url = browser.current_url() or resolved.item.url
+        http_status = _last_http_status(browser)
+        error_kind = _error_page_kind(html, http_status)
         record(
             "open_most_recent",
             {
                 "url": resolved.item.url,
-                "final_url": browser.current_url() or resolved.item.url,
+                "final_url": final_url,
                 "date": resolved.item.date,
                 "title": resolved.item.title,
                 "undated": len(resolved.undated),
                 "reason": resolved.reason,
                 "selection": "document_order" if resolved.reason else "date",
+                **({"http_status": http_status} if http_status else {}),
+                **({"error_page": error_kind} if error_kind else {}),
             },
             "ok",
             html,
             risk,
         )
-        metadata["latest_content_url"] = browser.current_url() or resolved.item.url
+        if error_kind:
+            _remember_error_page(metadata, spec, trajectory, error_kind, final_url)
+            errors.append(Issue(error_kind, f"Latest content landed on an error page ({error_kind})", retryable=False))
+            status = worse_status(status, _keep_earned_homepage(spec, trajectory, RunStatus.FAILED))
+            return status, html, rows, columns, extract_step, screenshot_note
+        metadata["latest_content_url"] = final_url
         metadata["latest_content_date"] = resolved.item.date
         return status, html, rows, columns, extract_step, screenshot_note
 
@@ -746,20 +776,39 @@ def _apply_action(
         match_text = str(args.get("match_text") or "")
         destination = _click_destination(args, browser, spec, html)
         if destination:
+            refused = _invalid_url_reason(destination)
+            if refused:
+                record(
+                    "click",
+                    {
+                        "selector": selector,
+                        "url": destination,
+                        "reason": refused,
+                        **({"match_text": match_text} if match_text else {}),
+                    },
+                    "rejected",
+                    html,
+                    risk,
+                )
+                return status, html, rows, columns, extract_step, screenshot_note
             browser.goto(destination)
             html = _await_rendered_page(browser, spec, remaining_ms, selector)
-            record(
-                "navigate",
-                {
-                    "url": destination,
-                    "final_url": browser.current_url() or destination,
+            status, html = _finish_navigation(
+                browser=browser,
+                spec=spec,
+                requested=destination,
+                html=html,
+                record=record,
+                risk=risk,
+                metadata=metadata,
+                errors=errors,
+                status=status,
+                trajectory=trajectory,
+                extra_args={
                     "from": "click",
                     "selector": selector,
                     **({"match_text": match_text} if match_text else {}),
                 },
-                "ok",
-                html,
-                risk,
             )
             return status, html, rows, columns, extract_step, screenshot_note
         click = getattr(browser, "click", None)
@@ -1004,6 +1053,10 @@ def _capture_screenshot(
     filename = _screenshot_filename(target_name, role)
     screenshot_path = store.evidence_dir / filename
     metrics = _page_metrics(browser)
+    http_status = _last_http_status(browser)
+    error_kind = _error_page_kind(html, http_status) or (
+        "error_page" if _url_is_error_page(current_url, metadata) else ""
+    )
     metadata["screenshot_scope"] = spec.screenshot_scope
     metadata["screenshot_metrics"] = metrics
     try:
@@ -1018,6 +1071,8 @@ def _capture_screenshot(
                 "role": role,
                 "target": target_name,
                 **metrics,
+                **({"http_status": http_status} if http_status else {}),
+                **({"error_page": error_kind} if error_kind else {}),
             },
             "ok",
             html,
@@ -1030,9 +1085,15 @@ def _capture_screenshot(
                 _screenshot_description(role, use_full_page),
                 source_url=current_url,
                 trajectory_step=event.step,
+                page_metrics=metrics,
+                http_status=http_status,
+                error_page=bool(error_kind),
             )
         )
-        if role == "latest_content" and current_url:
+        if error_kind:
+            _remember_error_page(metadata, spec, trajectory or [], error_kind, current_url)
+            status = worse_status(status, _keep_earned_homepage(spec, trajectory or [], RunStatus.FAILED))
+        elif role == "latest_content" and current_url:
             metadata.setdefault("latest_content_url", current_url)
         return status, "screenshot_captured"
     except NotImplementedError as exc:
@@ -1263,6 +1324,11 @@ def _requirements_satisfied(
     if _missing_screenshot_role(spec, trajectory):
         return False
     if "latest_content" in spec.screenshot_roles and not metadata.get("latest_content_url"):
+        return False
+    unmet = {str(item) for item in (metadata.get("unmet_requirements") or [])}
+    if unmet & {"error_page", "not_found"}:
+        return False
+    if any(getattr(item, "error_page", False) for item in artifacts if item.type in {"screenshot", "html_snapshot"}):
         return False
     return True
 
@@ -1622,6 +1688,205 @@ def _is_bare_tag_selector(selector: str) -> bool:
     return not raw or raw in _BARE_TAG_SELECTORS
 
 
+_URL_WHITESPACE_RE = re.compile(r"\s")
+_URL_PROSE_RE = re.compile(r"[A-Za-z]{2,}\s+[A-Za-z]{2,}\s+[A-Za-z]{2,}")
+_ALLOWED_URL_SCHEMES = {"http", "https", "file", "fixture"}
+_REMOTE_URL_SCHEMES = {"http", "https"}
+_ERROR_HTTP_STATUS = {404, 410, 500, 502, 503, 504}
+_BLOCKED_HTTP_STATUS = {401, 403}
+_NOT_FOUND_LABEL_RE = re.compile(
+    r"^(?:404(?:\s*[-:|]\s*.{0,40})?|(?:the\s+)?page\s+not\s+found|not\s+found)(?:\s*[-:|]\s*.{0,40})?$",
+    re.I,
+)
+_SERVER_ERROR_LABEL_RE = re.compile(
+    r"^(?:500|internal\s+server\s+error|502|bad\s+gateway|503|service\s+unavailable)(?:\s*[-:|]\s*.{0,40})?$",
+    re.I,
+)
+
+
+def _invalid_url_action_reason(action: BrowserAction, spec: TaskSpec) -> str:
+    if action.type == "navigate":
+        return _invalid_url_reason(str(action.args.get("url") or spec.target_url or ""))
+    if action.type == "click":
+        explicit = str(action.args.get("url") or "").strip()
+        if explicit:
+            return _invalid_url_reason(explicit)
+    return ""
+
+
+def _invalid_url_reason(url: str) -> str:
+    raw = url or ""
+    if not raw.strip():
+        return "invalid_url"
+    if _URL_WHITESPACE_RE.search(raw):
+        return "invalid_url"
+    try:
+        decoded = unquote(raw)
+    except Exception:
+        return "invalid_url"
+    if _URL_WHITESPACE_RE.search(decoded):
+        return "invalid_url"
+    if raw.count("?") > 1 or decoded.count("?") > 1:
+        return "invalid_url"
+    parsed = urlparse(raw)
+    if not parsed.scheme:
+        return "invalid_url"
+    scheme = parsed.scheme.lower()
+    if scheme not in _ALLOWED_URL_SCHEMES:
+        return "invalid_url"
+    if scheme in _REMOTE_URL_SCHEMES and not parsed.netloc:
+        return "invalid_url"
+    if scheme in {"file", "fixture"} and not (parsed.path or parsed.netloc):
+        return "invalid_url"
+    query = parsed.query or ""
+    if query and _URL_WHITESPACE_RE.search(unquote_plus(query)):
+        return "invalid_url"
+    if _URL_PROSE_RE.search(f"{unquote(parsed.path or '')} {unquote_plus(query)}"):
+        return "invalid_url"
+    return ""
+
+
+def _last_http_status(browser: Any) -> int:
+    getter = getattr(browser, "last_http_status", None)
+    if callable(getter):
+        try:
+            return int(getter() or 0)
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return int(getattr(browser, "_last_http_status", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _error_page_kind(html: str, status: int = 0) -> str:
+    code = int(status or 0)
+    if code in {404, 410}:
+        return "not_found"
+    if code in _ERROR_HTTP_STATUS or code >= 500:
+        return "error_page"
+    title, heading, text = _page_error_signals(html)
+    if _looks_like_not_found_label(title) or _looks_like_not_found_label(heading):
+        return "not_found"
+    if _looks_like_server_error_label(title) or _looks_like_server_error_label(heading):
+        return "error_page"
+    if text and len(text.split()) < 40 and (
+        _looks_like_not_found_label(text) or _NOT_FOUND_LABEL_RE.search(text)
+    ):
+        return "not_found"
+    return ""
+
+
+def _page_error_signals(html: str) -> tuple[str, str, str]:
+    if not html:
+        return "", "", ""
+    try:
+        root = parse_html(html)
+    except Exception:
+        return "", "", ""
+    titles = query(root, "title")
+    title = titles[0].text.strip() if titles else ""
+    heading = ""
+    for tag in ("h1", "h2"):
+        for node in query(root, tag):
+            label = node_visible_text(node).strip()
+            if label:
+                heading = label
+                break
+        if heading:
+            break
+    try:
+        text = node_visible_text(root)
+    except Exception:
+        text = ""
+    return title, heading, text
+
+
+def _looks_like_not_found_label(text: str) -> bool:
+    blob = re.sub(r"\s+", " ", (text or "").strip())
+    return bool(blob and _NOT_FOUND_LABEL_RE.match(blob))
+
+
+def _looks_like_server_error_label(text: str) -> bool:
+    blob = re.sub(r"\s+", " ", (text or "").strip())
+    return bool(blob and _SERVER_ERROR_LABEL_RE.match(blob))
+
+
+def _url_is_error_page(url: str, metadata: Dict[str, Any]) -> bool:
+    if not url:
+        return False
+    for item in metadata.get("error_page_urls") or []:
+        if url.rstrip("/") == str(item).rstrip("/"):
+            return True
+    return False
+
+
+def _remember_error_page(
+    metadata: Dict[str, Any],
+    spec: TaskSpec,
+    trajectory: List[TrajectoryEvent],
+    kind: str,
+    url: str,
+) -> None:
+    extra = [kind] if kind else ["error_page"]
+    if "latest_content" in spec.screenshot_roles and _homepage_captured(trajectory):
+        if "latest_content" not in extra:
+            extra.append("latest_content")
+    metadata["unmet_requirements"] = _merge_unmet(metadata, extra)
+    urls = [str(item) for item in (metadata.get("error_page_urls") or [])]
+    if url and url not in urls:
+        urls.append(url)
+    metadata["error_page_urls"] = urls
+
+
+def _finish_navigation(
+    *,
+    browser: Any,
+    spec: TaskSpec,
+    requested: str,
+    html: str,
+    record,
+    risk: str,
+    metadata: Dict[str, Any],
+    errors: List[Issue],
+    status: RunStatus,
+    trajectory: List[TrajectoryEvent],
+    extra_args: Optional[Dict[str, Any]] = None,
+) -> tuple[RunStatus, str]:
+    final_url = ""
+    try:
+        final_url = browser.current_url() or requested
+    except Exception:
+        final_url = requested
+    http_status = _last_http_status(browser)
+    args = {"url": requested, "final_url": final_url, **(extra_args or {})}
+    if http_status:
+        args["http_status"] = http_status
+    blocked = http_status in _BLOCKED_HTTP_STATUS or _is_site_stop_page(
+        html, spec.required_selector, final_url
+    )
+    if blocked:
+        reason = (
+            "authentication_required"
+            if http_status in {401, 403} or _is_auth_wall(html, spec.required_selector, final_url)
+            else "site_policy"
+        )
+        record("navigate", args, "ok", html, risk)
+        record("report_blocked", {"reason": reason}, "blocked", html, risk)
+        errors.append(Issue("blocked", _blocked_message(reason), retryable=False))
+        return RunStatus.BLOCKED, html
+    error_kind = _error_page_kind(html, http_status)
+    if error_kind:
+        args["error_page"] = error_kind
+        record("navigate", args, "ok", html, risk)
+        _remember_error_page(metadata, spec, trajectory, error_kind, final_url)
+        errors.append(Issue(error_kind, f"Landed on an error page ({error_kind})", retryable=False))
+        status = worse_status(status, _keep_earned_homepage(spec, trajectory, RunStatus.FAILED))
+        return status, html
+    record("navigate", args, "ok", html, risk)
+    return status, html
+
+
 def _is_vague_locator(action: BrowserAction) -> bool:
     if action.type not in {"click", "type", "select"}:
         return False
@@ -1882,6 +2147,8 @@ def _maybe_write_html(
             origin = ""
     if not page_belongs_to_target(origin, spec.target_url, trajectory or []):
         return
+    http_status = _last_http_status(browser) if browser is not None else 0
+    error_kind = _error_page_kind(html, http_status)
     artifacts.append(
         store.write_text_artifact(
             "html_snapshot",
@@ -1890,6 +2157,8 @@ def _maybe_write_html(
             "Page HTML captured at collection time",
             source_url=origin,
             trajectory_step=step,
+            http_status=http_status,
+            error_page=bool(error_kind),
         )
     )
 

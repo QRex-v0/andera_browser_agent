@@ -95,6 +95,9 @@ class Artifact:
     source_url: str = ""
     captured_at: str = ""
     trajectory_step: int = 0
+    page_metrics: Dict[str, Any] = field(default_factory=dict)
+    http_status: int = 0
+    error_page: bool = False
 
 
 @dataclass

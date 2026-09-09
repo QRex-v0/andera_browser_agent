@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from statistics import median
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -159,6 +160,7 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
         if shots:
             for item in shots:
                 _check_screenshot(spec, outcome, item, record)
+            _check_screenshot_height_outliers(shots, record)
         elif expected == 0:
             _check_screenshot(spec, outcome, None, record)
 
@@ -340,6 +342,15 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
                 ),
                 RunStatus.FAILED,
             )
+            if _artifact_from_error_page(artifact, outcome):
+                kind = "not_found" if _error_page_named(artifact, outcome) == "not_found" else "error_page"
+                record(
+                    "error_page",
+                    False,
+                    f"{artifact.type} was captured from an error page",
+                    RunStatus.PARTIAL,
+                    kind,
+                )
 
     for artifact in outcome.artifacts:
         if artifact.type == "metadata":
@@ -405,11 +416,7 @@ def _check_screenshot(spec: TaskSpec, outcome: ExecutionOutcome, artifact: Optio
     )
     if not ok or dims is None:
         return
-    metrics = {}
-    if isinstance(outcome.metadata, dict):
-        recorded = outcome.metadata.get("screenshot_metrics")
-        if isinstance(recorded, dict):
-            metrics = recorded
+    metrics = dict(artifact.page_metrics or {})
     dim_ok, dim_msg = png_scope_plausible(dims[0], dims[1], scope, outcome.environment, metrics)
     record(
         "screenshot_dimensions",
@@ -418,6 +425,72 @@ def _check_screenshot(spec: TaskSpec, outcome: ExecutionOutcome, artifact: Optio
         RunStatus.PARTIAL,
         "screenshot",
     )
+
+
+def _check_screenshot_height_outliers(shots: List[Artifact], record) -> None:
+    heights: List[Tuple[Artifact, int]] = []
+    for item in shots:
+        path = Path(item.path) if item.path else None
+        if path is None or not path.is_file():
+            continue
+        ok, dims, _ = inspect_png(path.read_bytes())
+        if ok and dims:
+            heights.append((item, dims[1]))
+    if len(heights) < 2:
+        return
+    for item, height in heights:
+        others = [other_height for other, other_height in heights if other is not item]
+        if not others:
+            continue
+        peer_median = float(median(others))
+        peer_max = float(max(others))
+        if height < 0.25 * peer_median or height < 0.25 * peer_max:
+            record(
+                "screenshot_height_outlier",
+                False,
+                (
+                    f"Screenshot height {height} is an outlier versus sibling captures "
+                    f"(median {int(peer_median)}, max {int(peer_max)})"
+                ),
+                RunStatus.PARTIAL,
+                "screenshot_height_outlier",
+            )
+
+
+def _artifact_from_error_page(artifact: Artifact, outcome: ExecutionOutcome) -> bool:
+    if artifact.error_page:
+        return True
+    source = artifact.source_url or ""
+    if not source:
+        return False
+    for url in (outcome.metadata or {}).get("error_page_urls") or []:
+        if urls_equivalent(source, str(url)):
+            return True
+    for event in outcome.trajectory:
+        if not event.args.get("error_page"):
+            continue
+        landed = str(event.args.get("final_url") or event.url or "")
+        if landed and urls_equivalent(source, landed):
+            return True
+    return False
+
+
+def _error_page_named(artifact: Artifact, outcome: ExecutionOutcome) -> str:
+    if artifact.error_page:
+        status = int(artifact.http_status or 0)
+        if status in {404, 410}:
+            return "not_found"
+    for event in outcome.trajectory:
+        kind = str(event.args.get("error_page") or "")
+        if not kind:
+            continue
+        landed = str(event.args.get("final_url") or event.url or "")
+        if landed and artifact.source_url and urls_equivalent(artifact.source_url, landed):
+            return kind
+    unmet = {str(item) for item in (outcome.metadata or {}).get("unmet_requirements") or []}
+    if "not_found" in unmet:
+        return "not_found"
+    return "error_page"
 
 
 def _artifact_text_length(artifact: Artifact) -> int:

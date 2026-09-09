@@ -77,6 +77,9 @@ def build_provenance(spec: TaskSpec, outcome: ExecutionOutcome) -> Dict[str, Any
                 "source_url": item.source_url,
                 "captured_at": item.captured_at,
                 "trajectory_step": item.trajectory_step,
+                "page_metrics": dict(item.page_metrics or {}),
+                "http_status": item.http_status,
+                "error_page": item.error_page,
             }
             for item in outcome.artifacts
         ],

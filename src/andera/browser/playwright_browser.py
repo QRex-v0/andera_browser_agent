@@ -46,6 +46,7 @@ class PlaywrightBrowser:
             self._browser = self._playwright.chromium.launch(headless=headless)
             self._context = self._browser.new_context(**self._context_kwargs())
             self._page = self._context.new_page()
+            self._last_http_status = 0
         except Exception as exc:
             self._playwright_cm.__exit__(None, None, None)
             message = str(exc)
@@ -58,11 +59,18 @@ class PlaywrightBrowser:
             ) from None
 
     def goto(self, url: str) -> None:
-        self._page.goto(url, wait_until="domcontentloaded")
+        response = self._page.goto(url, wait_until="domcontentloaded")
+        try:
+            self._last_http_status = int(response.status) if response is not None else 0
+        except Exception:
+            self._last_http_status = 0
         try:
             self._page.wait_for_load_state("load", timeout=15000)
         except Exception:
             pass
+
+    def last_http_status(self) -> int:
+        return int(self._last_http_status or 0)
 
     def wait_for(self, selector: str, timeout_ms: int) -> None:
         self._page.wait_for_selector(selector, timeout=timeout_ms)
@@ -209,6 +217,7 @@ class PlaywrightBrowser:
             pass
         self._context = self._browser.new_context(**self._context_kwargs())
         self._page = self._context.new_page()
+        self._last_http_status = 0
 
     def environment(self) -> dict:
         return {

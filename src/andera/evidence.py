@@ -193,6 +193,9 @@ class EvidenceStore:
         source_url: str = "",
         trajectory_step: int = 0,
         captured_at: str | None = None,
+        page_metrics: Optional[Dict[str, Any]] = None,
+        http_status: int = 0,
+        error_page: bool = False,
     ) -> Artifact:
         data = path.read_bytes()
         return Artifact(
@@ -205,6 +208,9 @@ class EvidenceStore:
             source_url=source_url,
             captured_at=captured_at or utc_now(),
             trajectory_step=trajectory_step,
+            page_metrics=dict(page_metrics or {}),
+            http_status=int(http_status or 0),
+            error_page=bool(error_page),
         )
 
     def write_text_artifact(
@@ -215,10 +221,22 @@ class EvidenceStore:
         description: str,
         source_url: str = "",
         trajectory_step: int = 0,
+        page_metrics: Optional[Dict[str, Any]] = None,
+        http_status: int = 0,
+        error_page: bool = False,
     ) -> Artifact:
         path = self.run_dir / relative
         write_text(path, content)
-        return self.artifact_from_path(type_name, path, description, source_url, trajectory_step)
+        return self.artifact_from_path(
+            type_name,
+            path,
+            description,
+            source_url,
+            trajectory_step,
+            page_metrics=page_metrics,
+            http_status=http_status,
+            error_page=error_page,
+        )
 
     def write_csv_artifact(
         self,
