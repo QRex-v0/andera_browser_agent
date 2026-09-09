@@ -1,119 +1,98 @@
 # Andera Browser Agent
 
-General browser agent for **audit evidence collection**. This repository currently implements the first vertical slice: collect a user access list from a local mock portal, package CSV + page snapshot + structured metadata, and fail explicitly on timeout or missing evidence.
+Andera Browser Agent executes browser evidence collection tasks and emits reviewer-ready artifacts while refusing credential handling and mutating actions by design.
 
-## What this slice does
+The project supports live navigation and multi-page workflows, and it treats evidence as auditable facts rather than extracted text only.
 
-An auditor-style natural-language task such as:
+## Current implementation
 
-```text
-Collect the current user access list from the access review portal as CSV
-```
+This repository implements an agent pipeline that can be run from CLI or in batch mode. A task is planned, executed, and then independently verified.
 
-is parsed into a structured `TaskSpec`, executed against a local HTML fixture (or Playwright), independently verified, and written to a run directory:
+- `andera` CLI task input is converted into a structured `TaskSpec`.
+- Execution can target fixtures for deterministic local runs or Playwright for live sites.
+- Extracted data is written with provenance and artifact checks.
+- Verifier output is deterministic and code-based. It does not inspect planner reasoning.
+- Status output is always explicit and five-valued:
+  - `success`
+  - `partial`
+  - `blocked`
+  - `timeout`
+  - `failed`
 
-- `evidence/extracted-table.csv` — extracted table
-- `evidence/page-final.html` — HTML snapshot at collection time
-- `evidence/screenshot-final.png` — when a screenshot is requested and the backend can capture pixels
-- `provenance.json` — SHA-256 manifests and field-level evidence links
-- `trace.jsonl` — action trajectory
-- `report.html` — static reviewer report
-- `result.json` — status, timings, artifact paths, verifier checks, and errors
+### What works today (verified against live sites)
 
-Statuses are explicit: `success`, `partial`, `blocked`, `timeout`, or `failed`. Missing evidence never reports `success`.
+- Hacker News: collect top N stories to CSV (title, URL, points) plus a full-page screenshot. Rows and screenshot ordering were checked manually and matched.
+- GitHub pull requests: collect last N merged PRs with committer, reviewer, and merger by using list-to-detail navigation.
+- Multi-target fan-out: one run can cover several targets. Each target has independent evidence directories and status.
+- File download capture through browser download events with SHA-256 recorded.
+- Field-level provenance: each value carries source URL, capture timestamp, and trajectory step.
+- Independent verifier that can only downgrade a status, not upgrade it.
 
-## Setup
+## Design decisions (reasoning, not feature marketing)
 
-Python 3.9+ is required. The only supported setup is:
+### 1. Verifier and decider are separate parties
+
+The decider (planner/executor) and verifier must not share full context.  
+The verifier only sees the `TaskSpec`, produced artifacts, and provenance. It never sees the planner’s internal reasoning or the executor’s self-assessment. This is intentional and deterministic: no LLM call is made in verification.
+
+The practical effect is a stronger check against self-justification. If verification consumes the executor’s own narrative, a model can persuade itself into accepting incorrect outputs. Here, it can only fail checks against observed artifacts and declared contracts.
+
+### 2. Status is five-valued, not boolean
+
+A task can return useful non-terminal outcomes that would be lost under success/fail.  
+For example, “22 of 30 rows collected and the rest behind an auth wall” is meaningful as `partial` or `blocked` depending on evidence. A boolean model forces it into fabrication or total failure.
+
+In this system, missing evidence never reports success.
+
+### 3. Read-only is enforced by mechanism
+
+Actions are typed and risk-classified. A mutating action without write authorization is rejected and reported as `blocked`. Credentials are removed from trajectory data before persistence.
+
+No policy-only convention is used; the enforcement is part of the action execution path.
+
+### 4. Screenshots are evidence, not decoration
+
+Screenshots are a contracted artifact in every claim path.  
+The verifier checks existence, PNG validity, and plausible dimensions. A “full page” capture is incomplete if the file is truncated. This is how we make human review cheaper: the screenshot closes a gap that schema checks cannot close.
+
+## What we learned by running it
+
+- Provenance paid off immediately. In a multi-site task, all three screenshots came from the same site, while provenance consistently showed the true source URL for every artifact. But nothing compared an artifact’s recorded origin to the target it was filed under, so the mismatch was not machine-detected. This is the same failure shape as unconsumed observation digest in the next bullet.
+- Collected-but-unconsumed signal recurs. The executor logs observation digests each step but does not compare them, so a stalled loop can exhaust steps and end as `timeout`. Recording signal is not equivalent to acting on it.
+- The verifier contract has an unresolved circular dependency. It currently verifies against the planner-produced `TaskSpec`, so it checks “what the agent said it would do” rather than “what the operator asked.” If the planner omits requirements, no check is created for them. The intended fix is a deterministic contract extraction from the request, with the model only allowed to add requirements.
+- Status semantics still need one separation: `blocked` should mean external stop conditions (auth wall, 403, terms), while `failed` should mean capability gap. A current SEC EDGAR run is marked `blocked` where it should be `failed` because the auth-wall heuristic misclassifies “content has not rendered yet.” The run only took two steps: navigate, snapshot, stop. It never searched, clicked, or downloaded. We chose not to hardcode an SEC EDGAR path to make this task pass, because that would only add a one-off win and no reusable capability; hidden evaluations use unseen sites.
+
+## Out of scope (explicitly)
+
+- x.com timeline and LinkedIn profiles. These require authenticated sessions and conflict with site terms. Adding a hosted logged-in profile would reduce technical barrier but not legal/operational constraint.
+- Student roster collection (sorority task). Collecting personal information about identifiable individuals is out of scope for a compliance product regardless of technical accessibility; declining to collect is the design decision, not a missing capability.
+- Airbnb listings. Date-picker automation was omitted by design and should be considered future work.
+
+## Authentication model
+
+Credentials never enter the agent context, prompt, or action logs. Access to authenticated systems is achieved by operator-managed persistent browser profiles. The agent consumes existing login session state only.
+
+This aligns with audit workflows: an auditor signs into the environment, then delegates read-only navigation to the agent.
+
+## Validation and evaluation posture
+
+`evals/README.md` is the contract, not the implementation. The immediate implementation target is:
+
+1. A fixture generator that emits browser state.
+2. A separately stored oracle.
+3. Deterministic scorers.
+
+Fixtures in this repository are primarily regression exercises for status paths (`partial`, `blocked`, `timeout`) and are not a claim of full generalization.
+
+## Setup and execution
+
+Python 3.9+ is required. Common run path:
 
 ```bash
 make setup
 source .venv/bin/activate
+python -m andera run "Create a CSV of the top 5 stories on Hacker News with title, URL, and points, and take a full page screenshot" --browser playwright
+python -m andera run "For Notion, Figma, and 8Sleep, take a screenshot of the website, as well as a screenshot of the most recent press/media/blog/content released by them to show the company is still alive" --browser playwright
 ```
 
-That target creates `.venv`, installs the pinned dependencies from `requirements.txt` (`playwright==1.60.0`), and runs `playwright install chromium`. Do not install Playwright or Chromium by a separate ad-hoc command.
-
-## Run
-
-Fixture backend (default, no Chromium, deterministic):
-
-```bash
-python -m andera run "Collect the current user access list from the access review portal as CSV" --planner rule --browser fixture
-```
-
-Override the target or backend:
-
-```bash
-python -m andera run "Collect the access list as CSV" --url fixtures/portals/access-review.html --planner rule --browser fixture
-python -m andera run "Collect the access list as CSV and a screenshot" --planner rule --browser playwright
-```
-
-Exit code `0` means `success`. Any other status prints JSON and exits `1`. Parse/setup errors exit `2`.
-
-Production default is `--planner openai --browser playwright`. It reads `OPENAI_API_KEY` and `OPENAI_MODEL` from the process environment or `environment/.env.local`. Pass `--url` for unseen pages; do not put credentials in the task text.
-
-## Tests
-
-```bash
-python -m pytest
-```
-
-The suite covers:
-
-- Successful access-list collection from `fixtures/portals/access-review.html`
-- Generic table extraction from a second fixture (not the access-review portal)
-- Incomplete evidence when the table is present but empty (`partial`)
-- Timeout when the required table never appears
-- Navigation failure for a missing file
-- Authentication wall reported as `blocked`
-- Screenshot requested on the fixture backend (must be `partial`, not silent success)
-- Real Playwright Chromium collection of CSV + screenshot when the browser extra is installed
-
-The broader capability ladder and the machine-scoring contract live in [`evals/catalog.json`](evals/catalog.json), [`evals/adversarial_catalog.json`](evals/adversarial_catalog.json), and [`evals/README.md`](evals/README.md). The catalogs contain twelve clean tasks across four difficulty levels and twenty matched adversarial cases. Gold answers belong in evaluator-only oracles, not in the agent's working tree.
-
-## Design notes
-
-- **Accuracy first.** The agent extracts the visible access table rather than summarizing it.
-- **Deterministic planner.** The first slice uses a keyword parser, not an LLM, so runs stay consistent and cheap at sample scale.
-- **Browser port.** `FixtureBrowser` and `PlaywrightBrowser` share the same session interface. Tests and batch evals can stay on fixtures; live systems can swap in Playwright later.
-- **No silent evidence.** Missing rows, selector timeouts, and unavailable screenshot backends are first-class statuses with codes.
-
-## Generalization discipline
-
-The public eval set is a capability checklist, not a set of cases to encode. We track three different overfitting risks because each needs a different defense.
-
-### Site-specific code
-
-Production planning, execution, and verification code must not branch on known domains, portal names, fixed URL paths, task IDs, or page-specific selectors. Site knowledge may be discovered from observed browser state or documented APIs at runtime and cached with provenance and freshness metadata. Explicit test fixtures, security allowlists, and user-supplied configuration are permitted, but must remain data rather than hidden control flow.
-
-As those production layers are introduced, CI should statically scan them for known eval domains and page-specific selector or URL patterns. Fixture and test directories must be excluded explicitly rather than weakening the production rule. The long-term action interface should expose typed, observation-grounded operations instead of arbitrary JavaScript, raw XPath, or per-site escape hatches.
-
-The current `PORTAL_FIXTURES` mappings and `DEFAULT_SELECTOR` in `src/andera/parse.py` are deliberate scaffolding for the first local vertical slice. They are known generalization debt, not the intended production routing mechanism. The CLI's explicit selector option is a debugging aid and should not become the planner's normal path.
-
-### Task-specific logic
-
-Planning should translate a request into a generic task schema describing goals, constraints, and required evidence. It may use the user request and observed runtime state, but it must not recognize public-eval phrasing or emit prewritten answers and routes. A useful review test is: if every visible eval task were replaced, would the planner instructions and control flow remain unchanged?
-
-For each behavior change, record the general capability it adds and test that capability on at least one different fixture or workflow. The shorthand is: **change capabilities, never answers**.
-
-### Implicit tuning on the public evals
-
-Code review cannot detect prompts, budgets, thresholds, and retry policies tuned repeatedly against the same tasks. Before the next optimization cycle, define a sealed holdout of roughly ten tasks covering the same mechanism categories on different sites or fixtures: paginated extraction, download and capture, multi-site liveness, cross-site synthesis, deep navigation, and long workflows. Do not use that set for iteration; run it only at a release checkpoint and report both scores, denominators, and failure categories.
-
-If runtime-learned site skills or replays are added, the harness must support a mandatory cold-start run with that store empty. Cold-start success is the primary generalization metric because unseen tasks must be assumed to lack a useful cached skill. Warm runs measure the separate benefit of caching for cost, speed, and consistency. A material warm/cold gap must be reported and investigated rather than averaged away.
-
-Some site-shaped knowledge is legitimate. Discovering an available API or learning a navigation pattern from the live system is runtime competence; preloading an eval-specific lookup table is not. Cached discoveries must always have a working cold-start fallback.
-
-## Assumptions
-
-- The first workflow is a **read-only access-review table**, standing in for Workday/NetSuite/GitHub entitlement exports.
-- Known portal names (`access review`, `empty access`, `missing table`, `blocked login`) map to local fixtures. Other tasks need `--url`.
-- The fixture backend cannot produce pixels. Requesting a screenshot there is reported as `partial`, not success.
-
-## Limitations
-
-- No live enterprise SSO, auth, or anti-bot handling.
-- Natural-language coverage is narrow (access-list collection plus explicit URL/selector/timeout phrases).
-- Playwright Chromium is installed only via `make setup`; missing browsers fail fast and tell you to run that command.
-- One task per process; no queue, retry policy, or multi-page workflows yet.
-- Generalization CI, sealed holdout evaluation, and cold-start/warm-start comparison are design requirements above, not implemented in this first slice.
+Switch to fixture execution for deterministic local validation when needed. In all modes, failures should include explicit status, artifact paths, and verifier findings.
