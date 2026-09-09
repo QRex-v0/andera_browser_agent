@@ -39,7 +39,13 @@ def create_browser(name: str) -> BrowserSession:
         from andera.browser.playwright_browser import PlaywrightBrowser
 
         return PlaywrightBrowser()
-    raise ValueError(f"Unknown browser backend {name!r}. Use 'fixture' or 'playwright'.")
+    if name == "hosted":
+        from andera.browser.hosted import HostedBrowser
+
+        return HostedBrowser()
+    raise ValueError(
+        f"Unknown browser backend {name!r}. Use 'fixture', 'playwright', or 'hosted'."
+    )
 
 
 class EvidenceAgent:
