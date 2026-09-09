@@ -5,9 +5,17 @@ from pathlib import Path
 from typing import Dict
 from urllib.parse import urlparse
 
-from andera.models import TaskSpec
+from andera.models import TargetSpec, TaskSpec
 from andera.paths import fixture_path, repo_root
-from andera.schema import infer_required_columns, infer_row_limit, infer_screenshot_scope, needs_screenshot
+from andera.schema import (
+    infer_named_targets,
+    infer_required_columns,
+    infer_row_limit,
+    infer_screenshot_roles,
+    infer_screenshot_scope,
+    needs_screenshot,
+    wants_tabular,
+)
 
 DEFAULT_SELECTOR = 'table[data-evidence="access-list"]'
 DEFAULT_TIMEOUT_MS = 8000
@@ -29,8 +37,9 @@ def parse_task(message: str, target_url: str | None = None, timeout_ms: int | No
     if not text:
         raise ValueError("Task message is empty")
 
+    names = infer_named_targets(text)
     url = target_url or _extract_url(text) or _infer_portal_url(text)
-    if not url:
+    if not url and not names:
         raise ValueError(
             "Could not determine a target. Name a known portal "
             "(access review, empty access, missing table, blocked login) or pass --url."
@@ -44,11 +53,21 @@ def parse_task(message: str, target_url: str | None = None, timeout_ms: int | No
     timeout = timeout_ms if timeout_ms is not None else _extract_timeout(text)
     expect_rows = "csv" in artifacts
     row_limit = infer_row_limit(text)
+    roles = infer_screenshot_roles(text)
+    targets = [TargetSpec(name=name, url="") for name in names]
+    if url and not targets:
+        url = _normalize_target(url)
+    elif url:
+        url = _normalize_target(url)
+        if len(targets) == 1:
+            targets = [TargetSpec(name=targets[0].name, url=url)]
+    else:
+        url = ""
     subgoals = ["open_target", "observe_page", "collect_requested_evidence"]
     return TaskSpec(
         raw=text,
         intent=intent,
-        target_url=_normalize_target(url),
+        target_url=url,
         required_selector=selector,
         artifact_types=artifacts,
         timeout_ms=timeout,
@@ -60,10 +79,12 @@ def parse_task(message: str, target_url: str | None = None, timeout_ms: int | No
             "requested artifacts exist",
             "every output field has provenance",
         ],
-        step_budget=max(20, 8 + 2 * row_limit),
+        step_budget=max(24 if roles else 20, 8 + 2 * row_limit),
         write_actions_allowed=False,
         row_limit=row_limit,
         screenshot_scope=infer_screenshot_scope(text) if "screenshot" in artifacts else "full_page",
+        screenshot_roles=roles,
+        targets=targets,
     )
 
 
@@ -77,7 +98,7 @@ def _infer_intent(text: str) -> str:
 def _infer_artifacts(text: str) -> list[str]:
     lowered = text.lower()
     artifacts = []
-    if "csv" in lowered or "spreadsheet" in lowered or "access list" in lowered or "user" in lowered:
+    if wants_tabular(text) or ("user" in lowered and "access" in lowered):
         artifacts.append("csv")
     if "download" in lowered:
         artifacts.append("download")

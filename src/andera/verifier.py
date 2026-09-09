@@ -50,6 +50,8 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
 
     artifacts = {item.type: item for item in outcome.artifacts}
     requested_types = {str(item).lower() for item in spec.artifact_types}
+    for item in (outcome.metadata or {}).get("unmet_requirements") or []:
+        note_unmet(str(item))
 
     if "html_snapshot" in requested_types or outcome.html:
         artifact = artifacts.get("html_snapshot")
@@ -132,7 +134,24 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
                     )
 
     if "screenshot" in requested_types:
-        _check_screenshot(spec, outcome, artifacts.get("screenshot"), record)
+        shots = [item for item in outcome.artifacts if item.type == "screenshot"]
+        expected = len(spec.screenshot_roles) if spec.screenshot_roles else 1
+        blocked = set((outcome.metadata or {}).get("unmet_requirements") or [])
+        if blocked & {"content_index", "most_recent"} and spec.screenshot_roles:
+            expected = min(expected, 1)
+        if len(shots) < expected:
+            record(
+                "required_screenshot",
+                False,
+                f"Screenshot was requested but {len(shots)} of {expected} captures were produced",
+                RunStatus.PARTIAL,
+                "screenshot",
+            )
+        if shots:
+            for item in shots:
+                _check_screenshot(spec, outcome, item, record)
+        elif expected == 0:
+            _check_screenshot(spec, outcome, None, record)
 
     if "download" in requested_types:
         artifact = artifacts.get("download")

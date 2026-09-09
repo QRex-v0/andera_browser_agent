@@ -44,6 +44,10 @@ class FixtureBrowser:
             raise RuntimeError("No page loaded")
         return self._html
 
+    def settle(self, timeout_ms: int = 4000) -> None:
+        del timeout_ms
+        return None
+
     def screenshot(self, path: str, full_page: bool = True) -> None:
         del path, full_page
         raise NotImplementedError(

@@ -148,7 +148,24 @@ class PlaywrightBrowser:
             snapshot = None
         observed["accessibility"] = _compact_a11y(snapshot)
         observed["title"] = self._page.title() or observed.get("title", "")
+        from andera.observe import observation_digest
+
+        observed["digest"] = observation_digest(observed)
         return observed
+
+    def settle(self, timeout_ms: int = 4000) -> None:
+        budget = max(200, int(timeout_ms))
+        try:
+            self._page.wait_for_load_state("networkidle", timeout=min(budget, 8000))
+        except Exception:
+            try:
+                self._page.wait_for_load_state("load", timeout=min(budget, 4000))
+            except Exception:
+                pass
+        try:
+            self._page.wait_for_timeout(min(400, budget))
+        except Exception:
+            pass
 
     def current_url(self) -> str:
         return self._page.url

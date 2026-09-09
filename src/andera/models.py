@@ -33,6 +33,12 @@ class ActionRisk(str, Enum):
 
 
 @dataclass(frozen=True)
+class TargetSpec:
+    name: str
+    url: str
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     raw: str
     intent: str
@@ -49,6 +55,8 @@ class TaskSpec:
     write_actions_allowed: bool = False
     row_limit: int = 0
     screenshot_scope: str = "full_page"
+    screenshot_roles: List[str] = field(default_factory=list)
+    targets: List[TargetSpec] = field(default_factory=list)
 
 
 EvidenceTask = TaskSpec
