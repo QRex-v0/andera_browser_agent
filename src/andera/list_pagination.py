@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 import time
 from dataclasses import dataclass, field
@@ -27,6 +28,8 @@ class PaginationStep:
     after_count: int
     new_count: int
     duplicate_count: int = 0
+    cross_snapshot_duplicate_count: int = 0
+    within_snapshot_duplicate_count: int = 0
     url: str = ""
     selector: str = ""
     label: str = ""
@@ -44,6 +47,8 @@ class IncrementalListResult:
     termination_reason: str
     pagination_shape: str
     duplicate_count: int = 0
+    cross_snapshot_duplicate_count: int = 0
+    within_snapshot_duplicate_count: int = 0
     rounds: int = 0
     elapsed_ms: int = 0
     visited_urls: List[str] = field(default_factory=list)
@@ -58,6 +63,23 @@ class _Action:
     selector: str = ""
     label: str = ""
     evidence: str = ""
+
+
+@dataclass
+class _ActionOutcome:
+    ok: bool
+    detail: str = ""
+
+
+@dataclass
+class _MergeResult:
+    added: int = 0
+    cross_snapshot_duplicates: int = 0
+    within_snapshot_duplicates: int = 0
+
+    @property
+    def duplicate_count(self) -> int:
+        return self.cross_snapshot_duplicates + self.within_snapshot_duplicates
 
 
 def collect_incremental_records(
@@ -88,6 +110,8 @@ def collect_incremental_records(
     steps: List[PaginationStep] = []
     shapes: List[str] = []
     duplicate_total = 0
+    cross_snapshot_duplicate_total = 0
+    within_snapshot_duplicate_total = 0
     no_progress = 0
     last_html = initial_html or ""
     last_url = page_url
@@ -108,6 +132,8 @@ def collect_incremental_records(
             termination_reason=reason,
             pagination_shape=shape,
             duplicate_count=duplicate_total,
+            cross_snapshot_duplicate_count=cross_snapshot_duplicate_total,
+            within_snapshot_duplicate_count=within_snapshot_duplicate_total,
             rounds=rounds,
             elapsed_ms=int((time.monotonic() - started) * 1000),
             visited_urls=visited_urls,
@@ -122,7 +148,7 @@ def collect_incremental_records(
         last_url = url
         if url and url not in visited_urls:
             visited_urls.append(url)
-        added, duplicates = _merge_snapshot(
+        merge = _merge_snapshot(
             html,
             url,
             container_selector,
@@ -130,10 +156,9 @@ def collect_incremental_records(
             seen_snapshot_keys,
             accept_record,
         )
-        duplicate_total += duplicates
-        if added:
-            no_progress = 0
-
+        duplicate_total += merge.duplicate_count
+        cross_snapshot_duplicate_total += merge.cross_snapshot_duplicates
+        within_snapshot_duplicate_total += merge.within_snapshot_duplicates
         if requested > 0 and len(records_by_key) >= requested:
             return finish("target_count_reached", exhausted=False, rounds=rounds)
         if time.monotonic() >= deadline:
@@ -148,16 +173,35 @@ def collect_incremental_records(
         before = len(records_by_key)
         if action.shape == "next_link" and action.href:
             seen_next_hrefs.add(_canonical_url(action.href))
-        ok = _apply_action(browser, action)
-        if not ok:
-            return finish("source_exhausted", exhausted=True, rounds=rounds)
+        outcome = _apply_action(browser, action)
+        if not outcome.ok:
+            rounds += 1
+            shapes.append(action.shape)
+            steps.append(
+                PaginationStep(
+                    round=rounds,
+                    shape=action.shape,
+                    action=action.kind,
+                    before_count=before,
+                    after_count=before,
+                    new_count=0,
+                    duplicate_count=0,
+                    cross_snapshot_duplicate_count=0,
+                    within_snapshot_duplicate_count=0,
+                    url=action.href or url,
+                    selector=action.selector,
+                    label=action.label,
+                    evidence=_join_evidence(action.evidence, f"action failed: {outcome.detail}"),
+                )
+            )
+            return finish("action_failed", exhausted=False, rounds=rounds)
         _settle(browser, settle_ms)
 
         after_html = _safe_content(browser)
         after_url = _current_url(browser) or action.href or url
         last_html = after_html
         last_url = after_url
-        added, duplicates = _merge_snapshot(
+        merge = _merge_snapshot(
             after_html,
             after_url,
             container_selector,
@@ -165,7 +209,9 @@ def collect_incremental_records(
             seen_snapshot_keys,
             accept_record,
         )
-        duplicate_total += duplicates
+        duplicate_total += merge.duplicate_count
+        cross_snapshot_duplicate_total += merge.cross_snapshot_duplicates
+        within_snapshot_duplicate_total += merge.within_snapshot_duplicates
         rounds += 1
         shapes.append(action.shape)
         if after_url and after_url not in visited_urls:
@@ -177,15 +223,17 @@ def collect_incremental_records(
                 action=action.kind,
                 before_count=before,
                 after_count=len(records_by_key),
-                new_count=added,
-                duplicate_count=duplicates,
+                new_count=merge.added,
+                duplicate_count=merge.duplicate_count,
+                cross_snapshot_duplicate_count=merge.cross_snapshot_duplicates,
+                within_snapshot_duplicate_count=merge.within_snapshot_duplicates,
                 url=action.href or after_url,
                 selector=action.selector,
                 label=action.label,
                 evidence=action.evidence,
             )
         )
-        if added:
+        if merge.added:
             no_progress = 0
             continue
         no_progress += 1
@@ -215,7 +263,7 @@ def _merge_snapshot(
     records_by_key: Dict[str, RawRecord],
     seen_snapshot_keys: set[Tuple[str, Tuple[str, ...]]],
     accept_record: Optional[Callable[[RawRecord], bool]],
-) -> Tuple[int, int]:
+) -> _MergeResult:
     records = iter_raw_records(html, page_url, container_selector=container_selector)
     accepted: List[Tuple[str, RawRecord]] = []
     for record in records:
@@ -224,17 +272,28 @@ def _merge_snapshot(
         accepted.append((stable_record_key(record), record))
     snapshot_key = (_canonical_url(page_url), tuple(key for key, _record in accepted))
     if snapshot_key in seen_snapshot_keys:
-        return 0, 0
+        return _MergeResult()
     seen_snapshot_keys.add(snapshot_key)
     added = 0
-    duplicates = 0
+    cross_snapshot_duplicates = 0
+    within_snapshot_duplicates = 0
+    existing_keys = set(records_by_key)
+    snapshot_seen: set[str] = set()
     for key, record in accepted:
-        if key in records_by_key:
-            duplicates += 1
+        if key in snapshot_seen:
+            within_snapshot_duplicates += 1
+            continue
+        snapshot_seen.add(key)
+        if key in existing_keys:
+            cross_snapshot_duplicates += 1
             continue
         records_by_key[key] = record
         added += 1
-    return added, duplicates
+    return _MergeResult(
+        added=added,
+        cross_snapshot_duplicates=cross_snapshot_duplicates,
+        within_snapshot_duplicates=within_snapshot_duplicates,
+    )
 
 
 def _choose_action(
@@ -271,7 +330,7 @@ def _find_load_more(root) -> Optional[_Action]:
         return _Action(
             shape="load_more",
             kind="click",
-            selector=_CONTROL_SELECTOR,
+            selector=_control_selector(node),
             label=label,
             evidence=f"control label {label!r}",
         )
@@ -288,8 +347,8 @@ def _find_next_link(root, page_url: str, seen_next_hrefs: set[str]) -> Optional[
             continue
         rel = node.attrs.get("rel", "").lower().split()
         label = _node_label(node)
-        class_name = node.attrs.get("class", "").lower()
-        if "next" in rel or _NEXT_RE.search(label) or "next" in class_name:
+        class_tokens = _class_tokens(node)
+        if "next" in rel or _NEXT_RE.search(label) or "next" in class_tokens:
             return _Action(
                 shape="next_link",
                 kind="goto",
@@ -346,9 +405,9 @@ def _current_page_number(page_url: str, anchors: Sequence[Any]) -> int:
         label = _node_label(node)
         if not re.fullmatch(r"\d{1,4}", label):
             continue
-        class_name = node.attrs.get("class", "").lower()
+        class_tokens = _class_tokens(node)
         aria_current = node.attrs.get("aria-current", "").lower()
-        if aria_current == "page" or "current" in class_name or "selected" in class_name:
+        if aria_current == "page" or "current" in class_tokens or "selected" in class_tokens:
             return int(label)
     return 0
 
@@ -366,29 +425,34 @@ def _next_evidence(node, label: str) -> str:
     return ", ".join(bits) or "next-page anchor"
 
 
-def _apply_action(browser: Any, action: _Action) -> bool:
+def _apply_action(browser: Any, action: _Action) -> _ActionOutcome:
     try:
         if action.kind == "goto" and action.href:
             browser.goto(action.href)
-            return True
+            return _ActionOutcome(True)
         if action.kind == "click":
             click = getattr(browser, "click", None)
             if not callable(click):
-                return False
-            click(action.selector or _CONTROL_SELECTOR, action.label)
-            return True
+                return _ActionOutcome(False, "browser has no click method")
+            selector = action.selector or _CONTROL_SELECTOR
+            if action.label and _accepts_match_text(click):
+                click(selector, action.label)
+            else:
+                click(selector)
+            return _ActionOutcome(True)
         if action.kind == "scroll":
             scroll = getattr(browser, "scroll", None)
             if callable(scroll):
                 scroll()
-                return True
+                return _ActionOutcome(True)
             scroll_to_end = getattr(browser, "scroll_to_end", None)
             if callable(scroll_to_end):
                 scroll_to_end()
-                return True
-    except Exception:
-        return False
-    return False
+                return _ActionOutcome(True)
+            return _ActionOutcome(False, "browser has no scroll method")
+    except Exception as exc:
+        return _ActionOutcome(False, f"{type(exc).__name__}: {exc}")
+    return _ActionOutcome(False, f"unsupported action kind {action.kind!r}")
 
 
 def _settle(browser: Any, settle_ms: int) -> None:
@@ -457,12 +521,71 @@ def _node_label(node) -> str:
 
 def _disabled(node) -> bool:
     attrs = getattr(node, "attrs", {}) or {}
-    class_name = attrs.get("class", "").lower()
     return (
         "disabled" in attrs
         or attrs.get("aria-disabled", "").lower() == "true"
-        or "disabled" in class_name.split()
+        or "disabled" in _class_tokens(node)
     )
+
+
+def _class_tokens(node) -> set[str]:
+    return set(_class_token_list(node))
+
+
+def _class_token_list(node) -> List[str]:
+    attrs = getattr(node, "attrs", {}) or {}
+    return [token for token in attrs.get("class", "").lower().split() if token]
+
+
+def _control_selector(node) -> str:
+    attrs = getattr(node, "attrs", {}) or {}
+    tag = getattr(node, "tag", "") or ""
+    element_id = attrs.get("id", "")
+    if element_id:
+        return _attr_selector(tag, "id", element_id)
+    for attr in ("data-testid", "data-test", "data-cy", "aria-label", "title", "value"):
+        value = attrs.get(attr, "")
+        if value:
+            return _attr_selector(tag, attr, value)
+    href = attrs.get("href", "")
+    if tag == "a" and href:
+        return _attr_selector("a", "href", href)
+    role = attrs.get("role", "")
+    if role:
+        return _attr_selector("", "role", role)
+    for token in _class_token_list(node):
+        return _attr_selector(tag, "class~", token)
+    return _CONTROL_SELECTOR
+
+
+def _attr_selector(tag: str, attr: str, value: str) -> str:
+    prefix = tag or ""
+    return f"{prefix}[{attr}={_css_string(value)}]"
+
+
+def _css_string(value: str) -> str:
+    return '"' + (value or "").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _accepts_match_text(click: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(click)
+    except (TypeError, ValueError):
+        return False
+    positional = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional += 1
+    return positional >= 2
+
+
+def _join_evidence(*parts: str) -> str:
+    return "; ".join(part for part in parts if part)
 
 
 def _absolutize(href: str, page_url: str) -> str:

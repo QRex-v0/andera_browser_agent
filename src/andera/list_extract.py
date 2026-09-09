@@ -191,6 +191,12 @@ def collect_incremental_schema_rows(
     return columns, rows, "list_incremental", unmet, collection
 
 
+def enrich_linkedin_profile_rows(*args, **kwargs):
+    from andera.cross_source_lookup import enrich_linkedin_profile_rows as _enrich
+
+    return _enrich(*args, **kwargs)
+
+
 def public_rows(rows: List[Dict[str, str]], columns: Sequence[str]) -> List[Dict[str, str]]:
     return [{column: str(row.get(column, "")) for column in columns} for row in rows]
 
