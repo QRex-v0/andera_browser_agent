@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 
 from andera.html_query import node_visible_text, parse_html, table_to_rows
 from andera.schema import (
@@ -41,6 +41,10 @@ class RawRecord:
     title: str
     url: str
     text: str
+    target_text: str = ""
+    target_url: str = ""
+    target_anchor: str = ""
+    ordinal: int = 0
     links: List[Dict[str, str]] = field(default_factory=list)
     times: List[str] = field(default_factory=list)
 
@@ -73,6 +77,10 @@ def extract_schema_rows(
             row["_detail_url"] = record.url
             row["_source_url"] = page_url
             row["_item_text"] = record.text
+            row["_target_text"] = record.target_text
+            row["_target_url"] = record.target_url
+            row["_target_anchor"] = record.target_anchor
+            row["_ordinal"] = str(record.ordinal) if record.ordinal > 0 else ""
             if order.kind == "time":
                 row["_sort_key"] = event_timestamp(record.text, order.key, times=record.times)
     elif order.kind == "time":
@@ -88,7 +96,9 @@ def extract_schema_rows(
         mapped, sort_unmet = apply_semantic_sort(mapped, order, row_limit)
     else:
         sort_unmet = []
-        if row_limit > 0:
+        if _should_select_ordinal_row(columns, row_limit, order):
+            mapped = _select_ordinal_row(mapped, row_limit)
+        elif row_limit > 0:
             mapped = mapped[:row_limit]
     unmet = split_unmet_fields(public_rows(mapped, columns), columns)
     unmet.extend(item for item in sort_unmet if item not in unmet)
@@ -239,11 +249,11 @@ def iter_raw_records(html: str, page_url: str) -> List[RawRecord]:
     windows = _windows(best_parent, best_items)
     records: List[RawRecord] = []
     seen = set()
-    for window in windows:
-        record = _record_from_window(window, page_url)
+    for ordinal, window in enumerate(windows, start=1):
+        record = _record_from_window(window, page_url, root, ordinal)
         if not record or not record.title or not record.url:
             continue
-        key = (record.title, record.url)
+        key = (record.title, record.url, record.ordinal)
         if key in seen:
             continue
         seen.add(key)
@@ -315,6 +325,8 @@ def _project_record(record: RawRecord, columns: Sequence[str]) -> Dict[str, str]
             row[column] = record.url
         elif key in {"title", "headline", "name"}:
             row[column] = record.title
+        elif key in {"text", "full text", "content", "snippet", "excerpt"}:
+            row[column] = record.target_text or _labeled_text(record.text, column)
         elif "number" in key or key in {"pr", "id"}:
             row[column] = _identifier_from_url(record.url, f"{record.title} {record.text}")
         elif kind == "integer":
@@ -323,24 +335,38 @@ def _project_record(record: RawRecord, columns: Sequence[str]) -> Dict[str, str]
             )
         elif is_detail_field(column):
             row[column] = ""
+        elif _is_target_text_column(key):
+            row[column] = record.target_text
+        elif key in {"position", "index", "ordinal", "nth"}:
+            row[column] = str(record.ordinal) if record.ordinal > 0 else ""
         else:
             row[column] = _labeled_text(record.text, column)
     return row
 
 
-def _record_from_window(window: Sequence, page_url: str) -> Optional[RawRecord]:
+def _record_from_window(
+    window: Sequence, page_url: str, root, ordinal: int
+) -> Optional[RawRecord]:
     if not window:
         return None
     primary_links = _collect_links(window[0], page_url)
-    title_link = _choose_title_link(primary_links) or _choose_title_link(_collect_links_many(window, page_url))
+    all_links = _collect_links_many(window, page_url, include_fragments=True)
+    title_link = _choose_title_link(primary_links) or _choose_title_link(all_links)
+    if not title_link and all_links:
+        title_link = _first_link_candidate(all_links)
     if not title_link:
         return None
+    target_url, target_anchor, target_text = _resolve_same_document_target(all_links, root, page_url)
     text = " ".join(node_visible_text(node) for node in window).strip()
     text = re.sub(r"\s+", " ", text)
     return RawRecord(
         title=title_link["text"],
         url=title_link["href"],
         text=text,
+        target_text=target_text,
+        target_url=target_url,
+        target_anchor=target_anchor,
+        ordinal=ordinal,
         links=primary_links,
         times=_time_tag_values_from_nodes(window),
     )
@@ -363,19 +389,29 @@ def _choose_title_link(links: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
     return max(pool, key=lambda item: (len(item["text"]), len(item["href"])))
 
 
-def _collect_links_many(nodes: Sequence, page_url: str) -> List[Dict[str, str]]:
+def _collect_links_many(
+    nodes: Sequence, page_url: str, include_fragments: bool = False
+) -> List[Dict[str, str]]:
     links: List[Dict[str, str]] = []
     for node in nodes:
-        links.extend(_collect_links(node, page_url))
+        links.extend(_collect_links(node, page_url, include_fragments=include_fragments))
     return links
 
 
-def _collect_links(node, page_url: str) -> List[Dict[str, str]]:
+def _collect_links(
+    node, page_url: str, include_fragments: bool = False
+) -> List[Dict[str, str]]:
     found: List[Dict[str, str]] = []
 
     def walk(current) -> None:
         if current.tag == "a":
-            href = _absolutize(current.attrs.get("href", ""), page_url)
+            raw = current.attrs.get("href", "")
+            if raw.startswith("#"):
+                if not include_fragments:
+                    return
+            elif not _usable_href(raw):
+                return
+            href = _absolutize(raw, page_url)
             text = re.sub(r"\s+", " ", current.text or "").strip()
             found.append({"text": text, "href": href})
         for child in current.children:
@@ -383,6 +419,68 @@ def _collect_links(node, page_url: str) -> List[Dict[str, str]]:
 
     walk(node)
     return found
+
+
+def _first_link_candidate(links: Sequence[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    for link in links:
+        text = (link.get("text") or "").strip()
+        href = (link.get("href") or "").strip()
+        if not href:
+            continue
+        if not _noise_text(text):
+            return link
+    return links[0] if links else None
+
+
+def _resolve_same_document_target(
+    links: Sequence[Dict[str, str]],
+    root,
+    page_url: str,
+) -> Tuple[str, str, str]:
+    if not links or not root:
+        return "", "", ""
+    for link in links:
+        href = (link.get("href") or "").strip()
+        parsed = urlparse(href)
+        fragment = unquote(parsed.fragment or "").strip()
+        if not fragment:
+            continue
+        if not _is_same_document_fragment(href, page_url):
+            continue
+        target_node = _find_node_by_fragment(root, fragment)
+        if not target_node:
+            continue
+        text = node_visible_text(target_node)
+        return href, fragment, text
+    return "", "", ""
+
+
+def _is_same_document_fragment(href: str, page_url: str) -> bool:
+    if not href or not page_url:
+        return False
+    parsed = urlparse(href)
+    base = urlparse(page_url)
+    if not parsed.fragment:
+        return False
+    if parsed.scheme != base.scheme:
+        return False
+    if parsed.netloc != base.netloc:
+        return False
+    return (parsed.path or "").rstrip("/") == (base.path or "").rstrip("/")
+
+
+def _find_node_by_fragment(root, fragment: str):
+    target = fragment.lstrip("#")
+    if not target:
+        return None
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        attrs = getattr(node, "attrs", {})
+        if attrs.get("id") == target or attrs.get("name") == target:
+            return node
+        stack.extend(getattr(node, "children", []))
+    return None
 
 
 def _windows(parent, items: List) -> List[List]:
@@ -446,6 +544,38 @@ def _labeled_text(text: str, column: str) -> str:
     if match:
         return match.group(1).strip()
     return ""
+
+
+def _is_target_text_column(column_key: str) -> bool:
+    key = (column_key or "").lower()
+    return (
+        "target" in key
+        or "highlight" in key
+        or "source" in key
+        or "anchor" in key
+        or "jump" in key
+        or "portion" in key
+        or "excerpt" in key
+    )
+
+
+def _select_ordinal_row(rows: List[Dict[str, str]], index: int) -> List[Dict[str, str]]:
+    if index <= 0 or index > len(rows):
+        return []
+    return [rows[index - 1]]
+
+
+def _should_select_ordinal_row(
+    columns: Sequence[str], row_limit: int, order_spec: SortSpec
+) -> bool:
+    if order_spec.kind or row_limit <= 0:
+        return False
+    if len(columns) != 1:
+        return False
+    key = (columns[0] or "").lower().strip()
+    if key in {"text", "index", "position", "ordinal", "nth", "highlighted", "highlight", "target", "targeted", "source"}:
+        return True
+    return "reference" in key or _is_target_text_column(key)
 
 
 def _absolutize(href: str, page_url: str) -> str:
