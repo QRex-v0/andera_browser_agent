@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from andera.evidence import EvidenceStore, extract_table_schema
 from andera.html_query import parse_html, query
+from andera.content_index import discover_content_index, iter_content_items, resolve_most_recent
 from andera.list_extract import (
     apply_semantic_sort,
     detail_values,
@@ -30,8 +32,10 @@ from andera.models import (
     worse_status,
 )
 from andera.schema import infer_sort_spec, infer_status_filters, split_unmet_fields
-from andera.observe import observation_from_html
-from andera.planner import Planner, RulePlanner
+from andera.observe import observation_digest, observation_from_html
+from andera.planner import Planner, RulePlanner, _missing_screenshot_role
+from andera.targets import listed_targets, target_slug
+from andera.verifier import artifact_origin_matches, hosts_equivalent, origin_host
 
 
 MUTATING_TOKENS = (
@@ -47,6 +51,34 @@ MUTATING_TOKENS = (
     "upload",
 )
 
+_VERBOSE_URL_MAX = 72
+_VERBOSE_ARG_MAX = 72
+_VERBOSE_KEY_ARGS = {
+    "navigate": ("url",),
+    "download": ("path", "selector"),
+    "screenshot": ("role", "path"),
+}
+
+
+def _truncate_verbose(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _verbose_step(event: TrajectoryEvent) -> str:
+    url = _truncate_verbose(event.url or "", _VERBOSE_URL_MAX) or "-"
+    parts = [f"#{event.step}", event.action, event.outcome, url]
+    extra = ""
+    for key in _VERBOSE_KEY_ARGS.get(event.action, ()):
+        value = event.args.get(key)
+        if value:
+            extra = _truncate_verbose(str(value), _VERBOSE_ARG_MAX)
+            break
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
+
 
 def execute(
     browser: Any,
@@ -55,6 +87,7 @@ def execute(
     started: float,
     started_at: str,
     planner: Optional[Planner] = None,
+    verbose: bool = False,
 ) -> ExecutionOutcome:
     planner = planner or RulePlanner()
     artifacts: List[Artifact] = []
@@ -67,6 +100,8 @@ def execute(
     columns: List[str] = []
     extract_step = 0
     screenshot_note = ""
+    action_repeats: Dict[tuple, int] = {}
+    unstuck = False
     env = _environment(browser)
     requested_types = {str(item).lower() for item in spec.artifact_types}
     metadata: Dict[str, Any] = {
@@ -81,6 +116,7 @@ def execute(
         "row_limit": spec.row_limit,
         "required_columns": list(spec.required_columns),
         "screenshot_scope": spec.screenshot_scope,
+        "unmet_requirements": [],
     }
 
     def remaining_ms() -> int:
@@ -104,6 +140,8 @@ def execute(
         )
         trajectory.append(event)
         store.append_trace(event)
+        if verbose:
+            print(_verbose_step(event), file=sys.stderr, flush=True)
         return event
 
     def current_observation() -> Dict[str, Any]:
@@ -122,12 +160,22 @@ def execute(
         if remaining_ms() <= 0:
             errors.append(Issue("timeout", "Exceeded time budget", retryable=True))
             html = _safe_content(browser)
-            _maybe_write_html(store, artifacts, html, spec, trajectory[-1].step if trajectory else 0)
+            _maybe_write_html(
+                store,
+                artifacts,
+                html,
+                spec,
+                trajectory[-1].step if trajectory else 0,
+                browser=browser,
+                trajectory=trajectory,
+            )
             status = worse_status(status, RunStatus.TIMEOUT)
             break
 
         observation = current_observation()
         html = _safe_content(browser)
+        digest = str(observation.get("digest") or observation_digest(observation))
+        observation["digest"] = digest
 
         try:
             action = planner.decide(spec, observation, trajectory, screenshot_note=screenshot_note)
@@ -142,11 +190,29 @@ def execute(
                     status = worse_status(status, RunStatus.FAILED)
                     break
         screenshot_note = ""
+        signature = (digest, action.type)
+        action_repeats[signature] = action_repeats.get(signature, 0) + 1
+        if action_repeats[signature] >= 3:
+            if not unstuck and action.type != "scroll":
+                unstuck = True
+                action = BrowserAction("scroll", {})
+                record("checkpoint", {"reason": "loop_detected", "digest": digest}, "retry", html)
+            else:
+                errors.append(
+                    Issue("failed", "Observation loop detected; could not find another approach", retryable=False)
+                )
+                record("report_failed", {"reason": "stuck_loop", "digest": digest}, "failed", html)
+                status = worse_status(status, RunStatus.FAILED)
+                break
+        if not page_belongs_to_target(browser.current_url(), spec.target_url, trajectory):
+            action = _require_target_navigation(action, spec)
         risk = classify_risk(action.type, " ".join(str(v) for v in action.args.values()))
         if risk == ActionRisk.MUTATING.value and not spec.write_actions_allowed:
             record("report_blocked", {"reason": "mutating_action", "action": action.type}, "blocked", html, risk)
             errors.append(Issue("blocked", "Refusing a mutating browser action without write authorization", retryable=False))
-            _maybe_write_html(store, artifacts, html, spec, trajectory[-1].step)
+            _maybe_write_html(
+                store, artifacts, html, spec, trajectory[-1].step, browser=browser, trajectory=trajectory
+            )
             status = worse_status(status, RunStatus.BLOCKED)
             break
 
@@ -168,6 +234,7 @@ def execute(
                 remaining_ms=remaining_ms(),
                 risk=risk,
                 metadata=metadata,
+                trajectory=trajectory,
             )
         except FileNotFoundError as exc:
             record(action.type, action.args, "error", html, risk)
@@ -179,7 +246,15 @@ def execute(
             if _is_timeout(exc):
                 record(action.type, action.args, "timeout", html, risk)
                 errors.append(Issue("timeout", str(exc), retryable=True))
-                _maybe_write_html(store, artifacts, html, spec, trajectory[-1].step if trajectory else 0)
+                _maybe_write_html(
+                store,
+                artifacts,
+                html,
+                spec,
+                trajectory[-1].step if trajectory else 0,
+                browser=browser,
+                trajectory=trajectory,
+            )
                 status = worse_status(status, RunStatus.TIMEOUT)
                 break
             record(action.type, action.args, "error", html, risk)
@@ -187,7 +262,7 @@ def execute(
             status = worse_status(status, RunStatus.FAILED)
             break
 
-        if action.type in {"done_subgoal", "report_blocked"}:
+        if action.type in {"done_subgoal", "report_blocked", "report_failed"}:
             break
         if status in {RunStatus.BLOCKED, RunStatus.TIMEOUT, RunStatus.FAILED}:
             break
@@ -197,11 +272,21 @@ def execute(
             and csv_rows
             and (spec.row_limit == 0 or len(csv_rows) == spec.row_limit)
             and not split_unmet_fields(csv_rows, spec.required_columns)
-            and "screenshot" not in requested_types
+            and not _missing_screenshot_role(spec, trajectory)
             and "download" not in requested_types
         ):
             record("done_subgoal", {"status": status.value}, "ok", html, risk)
             break
+    else:
+        if status == RunStatus.SUCCESS and not _requirements_satisfied(spec, artifacts, rows, trajectory, metadata):
+            errors.append(Issue("timeout", "Exhausted step budget before requirements were met", retryable=True))
+            status = worse_status(status, RunStatus.TIMEOUT)
+
+    if remaining_ms() <= 0 and status == RunStatus.SUCCESS and not _requirements_satisfied(
+        spec, artifacts, rows, trajectory, metadata
+    ):
+        errors.append(Issue("timeout", "Exceeded time budget", retryable=True))
+        status = worse_status(status, RunStatus.TIMEOUT)
 
     if (
         "csv" in requested_types
@@ -211,18 +296,44 @@ def execute(
     ):
         selector = spec.required_selector or "table"
         columns, rows, extract_step, status = _extract(
-            browser, spec, store, artifacts, errors, record, html, selector, status, remaining_ms=remaining_ms()
+            browser,
+            spec,
+            store,
+            artifacts,
+            errors,
+            record,
+            html,
+            selector,
+            status,
+            remaining_ms=remaining_ms(),
+            trajectory=trajectory,
         )
 
     if html and not any(item.type == "html_snapshot" for item in artifacts):
-        _maybe_write_html(store, artifacts, html, spec, trajectory[-1].step if trajectory else 0)
+        _maybe_write_html(
+            store,
+            artifacts,
+            html,
+            spec,
+            trajectory[-1].step if trajectory else 0,
+            browser=browser,
+            trajectory=trajectory,
+        )
 
-    if (
+    while (
         "screenshot" in requested_types
-        and not any(item.type == "screenshot" for item in artifacts)
-        and not any(event.action == "screenshot" for event in trajectory)
-        and status not in {RunStatus.FAILED, RunStatus.BLOCKED}
+        and status not in {RunStatus.FAILED, RunStatus.BLOCKED, RunStatus.TIMEOUT}
     ):
+        missing_role = _missing_screenshot_role(spec, trajectory)
+        if not missing_role:
+            break
+        if missing_role == "latest_content" and not metadata.get("latest_content_url"):
+            break
+        if any(
+            event.action == "screenshot" and event.outcome == "unavailable" and str(event.args.get("role") or "") in {missing_role, ""}
+            for event in trajectory
+        ):
+            break
         html = html or _safe_content(browser)
         status, screenshot_note = _capture_screenshot(
             browser=browser,
@@ -236,7 +347,13 @@ def execute(
             html=html,
             risk=ActionRisk.READ.value,
             metadata=metadata,
+            role=missing_role,
+            trajectory=trajectory,
         )
+        if screenshot_note == "screenshot_unavailable":
+            break
+        if screenshot_note == "screenshot_rejected":
+            break
 
     if status == RunStatus.SUCCESS and not artifacts:
         status = RunStatus.PARTIAL
@@ -284,6 +401,7 @@ def _apply_action(
     remaining_ms: int,
     risk: str,
     metadata: Dict[str, Any],
+    trajectory: List[TrajectoryEvent],
 ) -> tuple:
     args = dict(action.args)
     selector = str(args.get("selector") or spec.required_selector or "table")
@@ -303,40 +421,138 @@ def _apply_action(
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "inspect":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         record("inspect", {"selector": selector}, "ok", html, risk)
         if _is_auth_wall(html, spec.required_selector or selector):
             record("report_blocked", {"reason": "authentication_required"}, "blocked", html)
             errors.append(Issue("blocked", "Target requires authentication or a mutating action the executor cannot take", retryable=False))
-            _maybe_write_html(store, artifacts, html, spec, extract_step)
+            _maybe_write_html(
+                store, artifacts, html, spec, extract_step, browser=browser, trajectory=trajectory
+            )
             return RunStatus.BLOCKED, html, rows, columns, extract_step, screenshot_note
         if args.get("need_screenshot"):
             screenshot_note = "screenshot_requested"
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "wait":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
+        timeout_ms = int(args.get("timeout_ms") or min(remaining_ms or spec.timeout_ms, 8000) or 4000)
+        if args.get("settle"):
+            _settle_browser(browser, timeout_ms)
+            html = _safe_content(browser)
+            record("wait", {"settle": True, "timeout_ms": timeout_ms}, "ok", html, risk)
+            return status, html, rows, columns, extract_step, screenshot_note
         if spec.required_columns:
             record("wait", {"selector": selector, "skipped": "schema_list"}, "skipped", html, risk)
             return status, html, rows, columns, extract_step, screenshot_note
-        timeout_ms = int(args.get("timeout_ms") or remaining_ms or spec.timeout_ms)
         browser.wait_for(selector, timeout_ms)
         html = _safe_content(browser)
         record("wait", {"selector": selector, "timeout_ms": timeout_ms}, "ok", html, risk)
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type in {"extract_table", "extract_list"}:
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         if rows:
             record(action.type, {"skipped": "already_have_rows"}, "skipped", html, risk)
             return status, html, rows, columns, extract_step, screenshot_note
         columns, rows, extract_step, status = _extract(
-            browser, spec, store, artifacts, errors, record, html, selector, status, action.type, remaining_ms
+            browser,
+            spec,
+            store,
+            artifacts,
+            errors,
+            record,
+            html,
+            selector,
+            status,
+            action.type,
+            remaining_ms,
+            trajectory=trajectory,
         )
         return status, html, rows, columns, extract_step, screenshot_note
 
+    if action.type == "open_content_index":
+        html = _ensure_page(browser, spec, record, risk, trajectory)
+        _settle_browser(browser, min(remaining_ms or 4000, 4000))
+        html = _safe_content(browser)
+        kinds = args.get("kinds") if isinstance(args.get("kinds"), list) else None
+        href = discover_content_index(html, browser.current_url() or spec.target_url, kinds)
+        if not href:
+            record("open_content_index", {"reason": "content_index_not_found"}, "failed", html, risk)
+            errors.append(
+                Issue(
+                    "failed",
+                    "Could not find a press, media, blog, or content page from the homepage",
+                    retryable=False,
+                )
+            )
+            metadata["unmet_requirements"] = list(
+                dict.fromkeys(list(metadata.get("unmet_requirements") or []) + ["content_index"])
+            )
+            return RunStatus.FAILED, html, rows, columns, extract_step, screenshot_note
+        browser.goto(href)
+        html = _safe_content(browser)
+        record(
+            "open_content_index",
+            {"url": href, "final_url": browser.current_url() or href},
+            "ok",
+            html,
+            risk,
+        )
+        metadata["content_index_url"] = browser.current_url() or href
+        return status, html, rows, columns, extract_step, screenshot_note
+
+    if action.type == "open_most_recent":
+        html = _ensure_page(browser, spec, record, risk, trajectory)
+        _settle_browser(browser, min(remaining_ms or 4000, 4000))
+        html = _safe_content(browser)
+        page_url = browser.current_url() or spec.target_url
+        items = iter_content_items(html, page_url)
+        resolved = resolve_most_recent(items)
+        metadata["undated_items"] = [
+            {"title": item.title, "url": item.url, "dated": False} for item in resolved.undated
+        ]
+        metadata["dated_item_count"] = sum(1 for item in items if item.dated)
+        if resolved.item is None:
+            record(
+                "open_most_recent",
+                {"reason": resolved.reason or "no_dated_content", "undated": len(resolved.undated)},
+                "failed",
+                html,
+                risk,
+            )
+            errors.append(
+                Issue(
+                    "failed",
+                    "No dated content item was found; undated items were not ranked as old",
+                    retryable=False,
+                )
+            )
+            metadata["unmet_requirements"] = list(
+                dict.fromkeys(list(metadata.get("unmet_requirements") or []) + ["most_recent"])
+            )
+            return RunStatus.FAILED, html, rows, columns, extract_step, screenshot_note
+        browser.goto(resolved.item.url)
+        html = _safe_content(browser)
+        record(
+            "open_most_recent",
+            {
+                "url": resolved.item.url,
+                "final_url": browser.current_url() or resolved.item.url,
+                "date": resolved.item.date,
+                "title": resolved.item.title,
+                "undated": len(resolved.undated),
+            },
+            "ok",
+            html,
+            risk,
+        )
+        metadata["latest_content_url"] = browser.current_url() or resolved.item.url
+        metadata["latest_content_date"] = resolved.item.date
+        return status, html, rows, columns, extract_step, screenshot_note
+
     if action.type == "screenshot":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         status, screenshot_note = _capture_screenshot(
             browser=browser,
             spec=spec,
@@ -350,11 +566,13 @@ def _apply_action(
             risk=risk,
             metadata=metadata,
             full_page=args.get("full_page"),
+            role=str(args.get("role") or ""),
+            trajectory=trajectory,
         )
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "download":
-        html = _ensure_page(browser, spec, record, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
         method = getattr(browser, "download", None)
         if not callable(method):
             warnings.append(Issue("download_unavailable", "Browser backend does not support downloads", retryable=False))
@@ -387,13 +605,17 @@ def _apply_action(
         download_path = Path(downloaded)
         if not download_path.exists():
             raise FileNotFoundError(f"Download did not create a file at {downloaded}")
+        download_url = browser.current_url() or ""
+        if not page_belongs_to_target(download_url, spec.target_url, trajectory):
+            record("download", {"selector": selector, "reason": "wrong_host"}, "rejected", html, risk)
+            return status, html, rows, columns, extract_step, screenshot_note
         event = record("download", {"path": str(download_path), "selector": selector}, "ok", html, risk)
         artifacts.append(
             store.artifact_from_path(
                 "download",
                 download_path,
                 "Downloaded filing document",
-                source_url=browser.current_url() or spec.target_url,
+                source_url=download_url,
                 trajectory_step=event.step,
             )
         )
@@ -413,6 +635,7 @@ def _apply_action(
                 html=html,
                 risk=risk,
                 metadata=metadata,
+                trajectory=trajectory,
             )
         return status, html, rows, columns, extract_step, "downloaded_and_snapshot"
 
@@ -456,10 +679,26 @@ def _apply_action(
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "report_blocked":
-        record("report_blocked", args, "blocked", html, risk)
-        errors.append(Issue("blocked", str(args.get("reason") or "Planner reported blocked"), retryable=False))
-        _maybe_write_html(store, artifacts, html, spec, extract_step)
-        return worse_status(status, RunStatus.BLOCKED), html, rows, columns, extract_step, screenshot_note
+        reason = str(args.get("reason") or "Planner reported blocked")
+        stop = _site_stop_status(reason)
+        record("report_blocked" if stop == RunStatus.BLOCKED else "report_failed", args, stop.value, html, risk)
+        errors.append(Issue(stop.value, reason, retryable=False))
+        _maybe_write_html(
+            store, artifacts, html, spec, extract_step, browser=browser, trajectory=trajectory
+        )
+        return worse_status(status, stop), html, rows, columns, extract_step, screenshot_note
+
+    if action.type == "report_failed":
+        reason = str(args.get("reason") or "Planner reported failed")
+        record("report_failed", args, "failed", html, risk)
+        errors.append(Issue("failed", reason, retryable=False))
+        metadata["unmet_requirements"] = list(
+            dict.fromkeys(list(metadata.get("unmet_requirements") or []) + _failed_requirement(reason))
+        )
+        _maybe_write_html(
+            store, artifacts, html, spec, extract_step, browser=browser, trajectory=trajectory
+        )
+        return worse_status(status, RunStatus.FAILED), html, rows, columns, extract_step, screenshot_note
 
     if action.type == "done_subgoal":
         record("done_subgoal", {"status": status.value}, "ok", html, risk)
@@ -483,11 +722,41 @@ def _capture_screenshot(
     risk: str,
     metadata: Dict[str, Any],
     full_page: Any = None,
+    role: str = "",
+    trajectory: Optional[List[TrajectoryEvent]] = None,
 ) -> tuple[RunStatus, str]:
-    if any(item.type == "screenshot" for item in artifacts):
+    role = role or "final"
+    existing = [
+        item
+        for item in artifacts
+        if item.type == "screenshot" and _artifact_role(item) == role
+    ]
+    if existing:
         return status, "screenshot_captured"
+    current_url = ""
+    try:
+        current_url = browser.current_url() or ""
+    except Exception:
+        current_url = ""
+    if not page_belongs_to_target(current_url, spec.target_url, trajectory or []):
+        record(
+            "screenshot",
+            {
+                "role": role,
+                "url": current_url,
+                "reason": "wrong_host",
+                "target_host": origin_host(spec.target_url),
+                "page_host": origin_host(current_url),
+            },
+            "rejected",
+            html,
+            risk,
+        )
+        return status, "screenshot_rejected"
     use_full_page = spec.screenshot_scope != "viewport" if full_page is None else bool(full_page)
-    screenshot_path = store.evidence_dir / "screenshot-final.png"
+    target_name = listed_targets(spec)[0].name if listed_targets(spec) else ""
+    filename = _screenshot_filename(target_name, role)
+    screenshot_path = store.evidence_dir / filename
     metrics = _page_metrics(browser)
     metadata["screenshot_scope"] = spec.screenshot_scope
     metadata["screenshot_metrics"] = metrics
@@ -500,6 +769,8 @@ def _capture_screenshot(
                 "path": str(screenshot_path),
                 "full_page": use_full_page,
                 "scope": spec.screenshot_scope,
+                "role": role,
+                "target": target_name,
                 **metrics,
             },
             "ok",
@@ -510,8 +781,8 @@ def _capture_screenshot(
             store.artifact_from_path(
                 "screenshot",
                 screenshot_path,
-                "Full-page screenshot" if use_full_page else "Viewport screenshot",
-                source_url=browser.current_url() or spec.target_url,
+                _screenshot_description(role, use_full_page),
+                source_url=current_url,
                 trajectory_step=event.step,
             )
         )
@@ -520,7 +791,13 @@ def _capture_screenshot(
         warnings.append(Issue("screenshot_unavailable", str(exc), retryable=False))
         record(
             "screenshot",
-            {"path": str(screenshot_path), "full_page": use_full_page, "scope": spec.screenshot_scope},
+            {
+                "path": str(screenshot_path),
+                "full_page": use_full_page,
+                "scope": spec.screenshot_scope,
+                "role": role,
+                "target": target_name,
+            },
             "unavailable",
             html,
             risk,
@@ -534,6 +811,96 @@ def _capture_screenshot(
             )
         )
         return status, "screenshot_unavailable"
+
+
+_SITE_STOP_TOKENS = (
+    "authentication_required",
+    "auth_wall",
+    "unauthorized",
+    "forbidden",
+    "403",
+    "401",
+    "captcha",
+    "consent",
+    "terms",
+    "paywall",
+    "mutating_action",
+)
+
+
+def _site_stop_status(reason: str) -> RunStatus:
+    blob = (reason or "").lower().replace("-", "_")
+    if any(token in blob for token in _SITE_STOP_TOKENS):
+        return RunStatus.BLOCKED
+    return RunStatus.FAILED
+
+
+def _failed_requirement(reason: str) -> List[str]:
+    blob = (reason or "").lower()
+    if "content_index" in blob or "newsroom" in blob:
+        return ["content_index"]
+    if "dated" in blob or "most_recent" in blob:
+        return ["most_recent"]
+    return []
+
+
+def _requirements_satisfied(
+    spec: TaskSpec,
+    artifacts: List[Artifact],
+    rows: List[Dict[str, str]],
+    trajectory: List[TrajectoryEvent],
+    metadata: Dict[str, Any],
+) -> bool:
+    types = {str(item).lower() for item in spec.artifact_types}
+    if "csv" in types and spec.expect_rows and not rows:
+        return False
+    if "download" in types and not any(item.type == "download" for item in artifacts):
+        return False
+    if _missing_screenshot_role(spec, trajectory):
+        return False
+    if "latest_content" in spec.screenshot_roles and not metadata.get("latest_content_url"):
+        return False
+    return True
+
+
+def _settle_browser(browser: Any, timeout_ms: int) -> None:
+    setter = getattr(browser, "settle", None)
+    if callable(setter):
+        try:
+            setter(int(timeout_ms))
+            return
+        except Exception:
+            return
+
+
+def _screenshot_filename(target_name: str, role: str) -> str:
+    parts = [target_slug(target_name) if target_name else "", target_slug(role) if role else "final"]
+    stem = "-".join(part for part in parts if part)
+    return f"screenshot-{stem}.png"
+
+
+def _screenshot_description(role: str, full_page: bool) -> str:
+    scope = "Full-page" if full_page else "Viewport"
+    labels = {
+        "homepage": "homepage screenshot",
+        "latest_content": "latest content screenshot",
+        "final": "screenshot",
+    }
+    return f"{scope} {labels.get(role, role + ' screenshot')}"
+
+
+def _artifact_role(artifact: Artifact) -> str:
+    description = (artifact.description or "").lower()
+    if "homepage" in description:
+        return "homepage"
+    if "latest content" in description:
+        return "latest_content"
+    path = Path(artifact.path).name.lower()
+    if "homepage" in path:
+        return "homepage"
+    if "latest-content" in path or "latest_content" in path:
+        return "latest_content"
+    return "final"
 
 
 def _page_metrics(browser: Any) -> Dict[str, Any]:
@@ -568,14 +935,24 @@ def _extract(
     status,
     action_name: str = "extract_table",
     remaining_ms: int = 0,
+    trajectory: Optional[List[TrajectoryEvent]] = None,
 ):
     page_url = ""
     try:
-        page_url = browser.current_url() or spec.target_url
+        page_url = browser.current_url() or ""
     except Exception:
-        page_url = spec.target_url
+        page_url = ""
     if not any(item.type == "html_snapshot" for item in artifacts) and html:
-        _maybe_write_html(store, artifacts, html, spec, 0, source_url=page_url)
+        _maybe_write_html(
+            store,
+            artifacts,
+            html,
+            spec,
+            0,
+            source_url=page_url,
+            browser=browser,
+            trajectory=trajectory or [],
+        )
     table_columns, table_rows = extract_table_schema(html, selector) if selector else ([], [])
     if not table_rows and selector not in {"", "table"}:
         table_columns, table_rows = extract_table_schema(html, "table")
@@ -627,7 +1004,7 @@ def _extract(
                 "evidence/extracted-table.csv",
                 csv_rows,
                 "Extracted table",
-                source_url=page_url or spec.target_url,
+                source_url=page_url,
                 trajectory_step=event.step,
                 fieldnames=columns,
             )
@@ -753,6 +1130,9 @@ def classify_risk(action_type: str, label: str = "") -> str:
         "extract_list",
         "extract_text",
         "screenshot",
+        "open_content_index",
+        "open_most_recent",
+        "report_failed",
         "scroll",
         "back",
         "download",
@@ -789,8 +1169,18 @@ def _maybe_write_html(
     spec: TaskSpec,
     step: int,
     source_url: str = "",
+    browser: Any = None,
+    trajectory: Optional[List[TrajectoryEvent]] = None,
 ) -> None:
     if not html or any(item.type == "html_snapshot" for item in artifacts):
+        return
+    origin = source_url
+    if not origin and browser is not None:
+        try:
+            origin = browser.current_url() or ""
+        except Exception:
+            origin = ""
+    if not page_belongs_to_target(origin, spec.target_url, trajectory or []):
         return
     artifacts.append(
         store.write_text_artifact(
@@ -798,19 +1188,25 @@ def _maybe_write_html(
             "evidence/page-final.html",
             html,
             "Page HTML captured at collection time",
-            source_url=source_url or spec.target_url,
+            source_url=origin,
             trajectory_step=step,
         )
     )
 
 
-def _ensure_page(browser: Any, spec: TaskSpec, record, risk: str) -> str:
+def _ensure_page(
+    browser: Any,
+    spec: TaskSpec,
+    record,
+    risk: str,
+    trajectory: Optional[List[TrajectoryEvent]] = None,
+) -> str:
     url = ""
     try:
         url = browser.current_url() or ""
     except Exception:
         url = ""
-    if url and not url.startswith("about:"):
+    if url and not url.startswith("about:") and hosts_equivalent(spec.target_url, url):
         html = _safe_content(browser)
         if html:
             return html
@@ -824,6 +1220,45 @@ def _ensure_page(browser: Any, spec: TaskSpec, record, risk: str) -> str:
         risk,
     )
     return html
+
+
+def page_belongs_to_target(
+    current_url: str,
+    target_url: str,
+    trajectory: Optional[List[TrajectoryEvent]] = None,
+) -> bool:
+    if not artifact_origin_matches(current_url, target_url):
+        return False
+    if origin_host(target_url):
+        return True
+    events = trajectory or []
+    return any(
+        event.action == "navigate" and event.outcome == "ok" and _navigation_reaches_target(event, target_url)
+        for event in events
+    )
+
+
+def _navigation_reaches_target(event: TrajectoryEvent, target_url: str) -> bool:
+    requested = str(event.args.get("url") or "")
+    landed = str(event.args.get("final_url") or event.url or "")
+    target = (target_url or "").rstrip("/")
+    if requested.rstrip("/") == target or landed.rstrip("/") == target:
+        return True
+    if origin_host(target_url):
+        return artifact_origin_matches(requested, target_url) or artifact_origin_matches(landed, target_url)
+    return False
+
+
+def _require_target_navigation(action: BrowserAction, spec: TaskSpec) -> BrowserAction:
+    if action.type == "navigate":
+        dest = str(action.args.get("url") or spec.target_url)
+        target_host = origin_host(spec.target_url)
+        if target_host and origin_host(dest) and origin_host(dest) != target_host:
+            return BrowserAction("navigate", {"url": spec.target_url})
+        return action
+    if action.type in {"report_blocked", "report_failed"}:
+        return action
+    return BrowserAction("navigate", {"url": spec.target_url})
 
 
 def _environment(browser: Any) -> Dict[str, Any]:

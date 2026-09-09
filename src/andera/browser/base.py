@@ -28,5 +28,8 @@ class BrowserSession(Protocol):
     def current_url(self) -> str:
         """Return the last successfully opened URL."""
 
+    def reset(self) -> None:
+        """Drop cookies, page, and navigation so the next target starts clean."""
+
     def close(self) -> None:
         """Release session resources."""

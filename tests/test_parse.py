@@ -45,6 +45,19 @@ def test_parse_class_selector() -> None:
     assert task.write_actions_allowed is False
 
 
+def test_parse_multi_target_liveness_task() -> None:
+    task = parse_task(
+        "For Alpha, Beta, and Gamma, take a screenshot of the website, as well as a "
+        "screenshot of the most recent press/media/blog/content released by them to "
+        "show the company is still alive"
+    )
+    assert [item.name for item in task.targets] == ["Alpha", "Beta", "Gamma"]
+    assert "screenshot" in task.artifact_types
+    assert "csv" not in task.artifact_types
+    assert task.expect_rows is False
+    assert task.screenshot_roles == ["homepage", "latest_content"]
+
+
 def test_parse_rejects_empty_task() -> None:
     with pytest.raises(ValueError, match="empty"):
         parse_task("   ")

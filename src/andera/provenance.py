@@ -8,6 +8,19 @@ from andera.models import ExecutionOutcome, TaskSpec
 def build_provenance(spec: TaskSpec, outcome: ExecutionOutcome) -> Dict[str, Any]:
     refs = [f"sha256:{item.sha256}" for item in outcome.artifacts if item.sha256]
     fields: List[Dict[str, Any]] = []
+    shots = [item for item in outcome.artifacts if item.type == "screenshot"]
+    for index, artifact in enumerate(shots):
+        fields.append(
+            {
+                "path": f"screenshots[{index}]",
+                "value": artifact.description or "screenshot",
+                "evidence_refs": [f"sha256:{artifact.sha256}"] if artifact.sha256 else [],
+                "source_url": artifact.source_url or outcome.target_url,
+                "captured_at": artifact.captured_at or outcome.finished_at,
+                "trajectory_step": artifact.trajectory_step,
+                "source_locator": {"kind": "screenshot", "index": index, "path": artifact.path},
+            }
+        )
     for row_index, row in enumerate(outcome.rows):
         for column, value in row.items():
             if str(column).startswith("_"):

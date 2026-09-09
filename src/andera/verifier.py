@@ -17,6 +17,8 @@ from andera.models import (
 )
 from andera.schema import column_type, is_absolute_http_url, parse_integer, split_unmet_fields
 
+_EVIDENCE_ARTIFACT_TYPES = {"screenshot", "html_snapshot", "csv", "download"}
+
 
 def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict] = None) -> VerifierReport:
     """Independent checks. May downgrade a status, never upgrade it."""
@@ -50,6 +52,8 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
 
     artifacts = {item.type: item for item in outcome.artifacts}
     requested_types = {str(item).lower() for item in spec.artifact_types}
+    for item in (outcome.metadata or {}).get("unmet_requirements") or []:
+        note_unmet(str(item))
 
     if "html_snapshot" in requested_types or outcome.html:
         artifact = artifacts.get("html_snapshot")
@@ -132,7 +136,24 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
                     )
 
     if "screenshot" in requested_types:
-        _check_screenshot(spec, outcome, artifacts.get("screenshot"), record)
+        shots = [item for item in outcome.artifacts if item.type == "screenshot"]
+        expected = len(spec.screenshot_roles) if spec.screenshot_roles else 1
+        blocked = set((outcome.metadata or {}).get("unmet_requirements") or [])
+        if blocked & {"content_index", "most_recent"} and spec.screenshot_roles:
+            expected = min(expected, 1)
+        if len(shots) < expected:
+            record(
+                "required_screenshot",
+                False,
+                f"Screenshot was requested but {len(shots)} of {expected} captures were produced",
+                RunStatus.PARTIAL,
+                "screenshot",
+            )
+        if shots:
+            for item in shots:
+                _check_screenshot(spec, outcome, item, record)
+        elif expected == 0:
+            _check_screenshot(spec, outcome, None, record)
 
     if "download" in requested_types:
         artifact = artifacts.get("download")
@@ -207,6 +228,24 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
             "Provenance records cite evidence hashes" if not dangling else "Provenance records missing evidence_refs",
             RunStatus.FAILED,
         )
+
+    for artifact in outcome.artifacts:
+        if artifact.type in _EVIDENCE_ARTIFACT_TYPES:
+            source = artifact.source_url or ""
+            origin_ok = artifact_origin_matches(source, spec.target_url)
+            record(
+                f"artifact_source:{artifact.type}",
+                origin_ok,
+                (
+                    f"{artifact.type} source host matches the target"
+                    if origin_ok
+                    else (
+                        f"{artifact.type} source_url host {origin_host(source)!r} "
+                        f"does not match target {origin_host(spec.target_url)!r}"
+                    )
+                ),
+                RunStatus.FAILED,
+            )
 
     for artifact in outcome.artifacts:
         if artifact.type == "metadata":
@@ -322,6 +361,25 @@ def hosts_equivalent(expected: str, actual: str) -> bool:
     if not expected_host and not actual_host:
         return expected_scheme == actual_scheme
     return expected_scheme == actual_scheme and expected_host == actual_host
+
+
+def origin_host(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def artifact_origin_matches(source_url: str, target_url: str) -> bool:
+    if not source_url or not target_url or source_url.startswith("about:"):
+        return False
+    source_host = origin_host(source_url)
+    target_host = origin_host(target_url)
+    if source_host or target_host:
+        return bool(target_host) and source_host == target_host
+    source_scheme = urlparse(source_url).scheme.lower()
+    target_scheme = urlparse(target_url).scheme.lower()
+    return source_scheme == target_scheme and source_scheme in {"file", "fixture"}
 
 
 def _host(url: str) -> str:

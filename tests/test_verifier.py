@@ -6,6 +6,12 @@ from andera.models import Artifact, ExecutionOutcome, RunStatus, TaskSpec
 from andera.verifier import verify
 
 
+def _artifact(type_name: str, source_url: str = "https://example.test/table", **kwargs) -> Artifact:
+    kwargs.setdefault("description", "")
+    kwargs.setdefault("path", f"{type_name}.dat")
+    return Artifact(type=type_name, source_url=source_url, **kwargs)
+
+
 def _spec(**kwargs) -> TaskSpec:
     values = dict(
         raw="Collect the table as CSV",
@@ -45,8 +51,8 @@ def test_verifier_rejects_success_without_rows() -> None:
         _spec(),
         _outcome(
             artifacts=[
-                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab"),
-                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab", source_url="https://example.test/table"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd", source_url="https://example.test/table"),
             ]
         ),
         provenance={"fields": []},
@@ -64,8 +70,8 @@ def test_verifier_rejects_success_without_screenshot() -> None:
             rows=rows,
             columns=["Name"],
             artifacts=[
-                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab"),
-                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab", source_url="https://example.test/table"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd", source_url="https://example.test/table"),
             ],
         ),
         provenance={
@@ -103,13 +109,14 @@ def test_deleted_screenshot_before_verification_is_partial(tmp_path: Path) -> No
     outcome = _outcome(
         html="<html>ok</html>",
         artifacts=[
-            Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab"),
+            Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab", source_url="https://example.test/table"),
             Artifact(
                 type="screenshot",
                 path=str(path),
                 description="Full-page screenshot",
                 bytes=path.stat().st_size,
                 sha256="cd",
+                source_url="https://example.test/table",
             ),
         ],
         environment={"viewport": {"width": 1280, "height": 720}},
@@ -136,6 +143,7 @@ def test_truncated_screenshot_is_partial(tmp_path: Path) -> None:
                     description="Full-page screenshot",
                     bytes=path.stat().st_size,
                     sha256="cd",
+                    source_url="https://example.test/table",
                 )
             ],
             environment={"viewport": {"width": 1280, "height": 720}},
@@ -158,8 +166,8 @@ def test_verifier_rejects_success_when_final_host_differs() -> None:
             rows=rows,
             columns=["Name"],
             artifacts=[
-                Artifact(type="html_snapshot", path="page.html", description="", bytes=40, sha256="ab"),
-                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=40, sha256="ab", source_url="https://zh.airbnb.com/s/Lake-Tahoe"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd", source_url="https://zh.airbnb.com/s/Lake-Tahoe"),
             ],
         ),
         provenance={
@@ -188,8 +196,8 @@ def test_verifier_does_not_treat_url_substring_as_a_visit() -> None:
             final_url="https://example.test.attacker.example/table",
             html="<html>captured</html>",
             artifacts=[
-                Artifact(type="html_snapshot", path="page.html", description="", bytes=20, sha256="ab"),
-                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=20, sha256="ab", source_url="https://example.test.attacker.example/table"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd", source_url="https://example.test.attacker.example/table"),
             ],
         ),
         provenance={"fields": []},
@@ -207,8 +215,8 @@ def test_verifier_accepts_same_host_and_path() -> None:
             final_url="https://example.test/table/",
             html="<html>ok</html>",
             artifacts=[
-                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab"),
-                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab", source_url="https://example.test/table"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd", source_url="https://example.test/table"),
             ],
         ),
         provenance={"fields": []},
@@ -228,8 +236,8 @@ def test_verifier_rejects_wrong_row_count_and_non_integer_points() -> None:
             rows=rows,
             columns=["title", "url", "points"],
             artifacts=[
-                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab"),
-                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab", source_url="https://example.test/table"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd", source_url="https://example.test/table"),
             ],
         ),
         provenance={
@@ -249,6 +257,54 @@ def test_verifier_rejects_wrong_row_count_and_non_integer_points() -> None:
     assert any(check.code == "required_row_count" and not check.passed for check in report.checks)
     assert any(check.code == "column_type:points" and not check.passed for check in report.checks)
     assert any(check.code == "column_type:url" and not check.passed for check in report.checks)
+
+
+def test_verifier_fails_when_artifact_host_does_not_match_target() -> None:
+    report = verify(
+        _spec(
+            target_url="https://www.figma.com/",
+            artifact_types=["screenshot", "html_snapshot"],
+            expect_rows=False,
+            screenshot_roles=["homepage", "latest_content"],
+        ),
+        _outcome(
+            provisional_status=RunStatus.SUCCESS,
+            target_url="https://www.figma.com/",
+            requested_url="https://www.figma.com/",
+            final_url="https://www.figma.com/",
+            html="<html>figma</html>",
+            artifacts=[
+                _artifact(
+                    "screenshot",
+                    source_url="https://www.notion.com/",
+                    path="homepage.png",
+                    description="homepage screenshot",
+                    bytes=64,
+                    sha256="aa",
+                ),
+                _artifact(
+                    "screenshot",
+                    source_url="https://www.notion.com/blog",
+                    path="latest.png",
+                    description="latest content screenshot",
+                    bytes=64,
+                    sha256="bb",
+                ),
+                _artifact(
+                    "html_snapshot",
+                    source_url="https://www.figma.com/",
+                    path="page.html",
+                    bytes=20,
+                    sha256="cc",
+                ),
+            ],
+        ),
+        provenance={"fields": []},
+    )
+    assert report.status == RunStatus.FAILED
+    assert report.status != RunStatus.PARTIAL
+    assert any(check.code == "artifact_source:screenshot" and not check.passed for check in report.checks)
+    assert any("notion.com" in check.message for check in report.checks if not check.passed)
 
 
 def test_verifier_never_upgrades_timeout() -> None:

@@ -76,8 +76,8 @@ _SCREENSHOT_IMPLICIT = (
     r"\b(?:take|save) (?:a |the )?(?:picture|photo|image)\b",
     r"\bvisual (?:record|evidence|proof|capture)\b",
     r"\b(?:show|prove|confirm) (?:that )?(?:the )?(?:site|page|service) (?:is )?(?:still )?(?:live|up|online)\b",
-    r"\bstill (?:live|up|online)\b",
-    r"\bis still (?:live|up|online)\b",
+    r"\bstill (?:live|up|online|alive)\b",
+    r"\bis still (?:live|up|online|alive)\b",
     r"\bshow (?:the |this )?(?:site|page)\b",
     r"\b(?:image|picture|photo) of (?:the )?(?:page|site)\b",
     r"\bfull[\s-]page (?:shot|capture|image)\b",
@@ -103,6 +103,49 @@ def infer_screenshot_scope(text: str) -> str:
     if re.search(r"\b(?:page|site)\b", source):
         return "full_page"
     return "full_page"
+
+
+_CONTENT_INDEX_HINT = r"\b(?:press|media|blog|newsroom|news|content|stories|journal|updates|articles)\b"
+_MOST_RECENT_HINT = r"\b(?:most recent|latest|newest)\b"
+_NAMED_TARGET_LEAD = re.compile(
+    r"\bfor\s+(.+?)\s*,\s+(?:take|collect|capture|create|export|find|open|visit|go)\b",
+    re.I,
+)
+_TARGET_SPLIT = re.compile(r"\s*(?:,|\band\b)\s*", re.I)
+
+
+def needs_most_recent(text: str) -> bool:
+    return bool(re.search(_MOST_RECENT_HINT, text or "", re.I))
+
+
+def mentions_content_index(text: str) -> bool:
+    return bool(re.search(_CONTENT_INDEX_HINT, text or "", re.I))
+
+
+def infer_screenshot_roles(text: str) -> List[str]:
+    if not needs_screenshot(text):
+        return []
+    if needs_most_recent(text) or mentions_content_index(text):
+        return ["homepage", "latest_content"]
+    return ["final"]
+
+
+def infer_named_targets(text: str) -> List[str]:
+    match = _NAMED_TARGET_LEAD.search(text or "")
+    if not match:
+        return []
+    blob = match.group(1).strip()
+    if re.search(r"\b(?:top|first|last|the)\s+\d+\b", blob, re.I):
+        return []
+    if re.search(r"\b(access review|empty access|missing table|blocked login)\b", blob, re.I):
+        return []
+    parts = [part.strip(" .") for part in _TARGET_SPLIT.split(blob) if part.strip(" .")]
+    names = [part for part in parts if 1 <= len(part.split()) <= 4 and 1 <= len(part) <= 40]
+    return names if len(names) >= 2 else []
+
+
+def wants_tabular(text: str) -> bool:
+    return bool(re.search(r"\b(?:csv|spreadsheet|table|access list)\b", text or "", re.I))
 
 
 def infer_row_limit(text: str) -> int:

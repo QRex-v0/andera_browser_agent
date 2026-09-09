@@ -37,6 +37,8 @@ def _plan_payload(url: str = "") -> str:
             "write_actions_allowed": False,
             "row_limit": 0,
             "screenshot_scope": "full_page",
+            "screenshot_roles": [],
+            "targets": [],
         }
     )
 
@@ -53,6 +55,7 @@ def _action(action_type: str, **kwargs: Any) -> str:
         "full_page": True,
         "match_text": "",
         "match_date": "",
+        "role": "",
     }
     return json.dumps(payload)
 

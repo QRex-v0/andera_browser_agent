@@ -7,9 +7,17 @@ import re
 from typing import Any, Dict, List, Protocol, Sequence
 
 from andera.env import openai_api_key, openai_model
-from andera.models import BrowserAction, TaskSpec, TrajectoryEvent
+from andera.models import BrowserAction, TargetSpec, TaskSpec, TrajectoryEvent
 from andera.parse import parse_task
-from andera.schema import infer_screenshot_scope, needs_screenshot
+from andera.schema import (
+    infer_named_targets,
+    infer_screenshot_roles,
+    infer_screenshot_scope,
+    needs_most_recent,
+    needs_screenshot,
+    wants_tabular,
+)
+from andera.targets import official_homepage
 
 ALLOWED_ACTIONS = (
     "navigate",
@@ -24,9 +32,12 @@ ALLOWED_ACTIONS = (
     "extract_list",
     "extract_text",
     "screenshot",
+    "open_content_index",
+    "open_most_recent",
     "download",
     "checkpoint",
     "report_blocked",
+    "report_failed",
     "done_subgoal",
 )
 
@@ -45,11 +56,18 @@ Never include secrets or API keys.
 Prefer generic evidence requirements such as a visible data table, CSV, HTML snapshot, or screenshot.
 If the request implies a visual record — explicitly ("take a screenshot") or implicitly ("show the site is still live", "capture the page") — include "screenshot" in artifact_types and set screenshot_scope to "viewport" or "full_page".
 Use full_page when the request says "full page" or the target content plausibly extends past one screen (lists, tables, long pages). Use viewport only when the operator asks for the visible viewport. Truncated page captures are incomplete evidence.
+If the task names several companies or sites, emit a targets array with each official public homepage URL. Do not include blog, press, newsroom, or media paths; those pages are discovered at runtime from the homepage.
+When the task asks for the website and the most recent published content, set screenshot_roles to homepage and latest_content. Do not request a CSV unless the operator asked for tabular output.
 """
 
 DECIDE_INSTRUCTIONS = """You are the executor planner for a read-only audit evidence browser agent.
 Given the TaskSpec, compact DOM/accessibility observation, and prior actions, choose the next typed browser action.
-Prefer accessibility/DOM observations. If artifact_types includes screenshot, emit a screenshot action that honors screenshot_scope before done_subgoal. Request an extra screenshot only if the page is visual, ambiguous, or not table-like.
+Prefer accessibility/DOM observations. If artifact_types includes screenshot, emit a screenshot action that honors screenshot_scope and the next missing screenshot_role before done_subgoal. Request an extra screenshot only if the page is visual, ambiguous, or not table-like.
+Choose only the next single action from the current observation. Do not emit a full script.
+If a required control is missing, wait once for asynchronously rendered content before concluding it is absent.
+If a newsroom, press, media, blog, or content index is required, follow a link that is visible in the observation. Do not invent a path.
+report_blocked only when the site stopped us (authentication, 403, terms, captcha). If we can see the page but lack a way to proceed, report_failed.
+If the most recent item is required, rank dated items by parsed date, not document order. An item without a date is undated, not old. If no dated item exists after waiting, report_failed.
 Use generic locators (table, role, accessible name). Do not use site-specific hardcoded selectors.
 Read-only: do not submit, approve, purchase, delete, or type into password fields.
 If list_candidates is nonempty, do not wait for a table; emit extract_table or extract_list.
@@ -105,6 +123,8 @@ class RulePlanner:
         trajectory: Sequence[TrajectoryEvent],
         screenshot_note: str = "",
     ) -> BrowserAction:
+        if _is_recency_capture(spec):
+            return _decide_recency(spec, observation, trajectory)
         done = {event.action for event in trajectory}
         if "navigate" not in done:
             return BrowserAction("navigate", {"url": spec.target_url})
@@ -123,8 +143,12 @@ class RulePlanner:
             return BrowserAction("wait", {"selector": selector, "timeout_ms": spec.timeout_ms})
         if "csv" in spec.artifact_types and not extracted:
             return BrowserAction("extract_table", {"selector": selector})
-        if "screenshot" in spec.artifact_types and "screenshot" not in done:
-            return BrowserAction("screenshot", {"full_page": spec.screenshot_scope != "viewport"})
+        missing = _missing_screenshot_role(spec, trajectory)
+        if missing:
+            return BrowserAction(
+                "screenshot",
+                {"full_page": spec.screenshot_scope != "viewport", "role": missing},
+            )
         return BrowserAction("done_subgoal", {})
 
 
@@ -158,11 +182,16 @@ class OpenAIPlanner:
                 artifacts.append("screenshot")
         elif "screenshot" in artifacts:
             artifacts = [item for item in artifacts if item != "screenshot"]
+        if not wants_tabular(message):
+            artifacts = [item for item in artifacts if item != "csv"]
         if "html_snapshot" not in artifacts:
             artifacts.append("html_snapshot")
-        url = target_url or str(payload.get("target_url") or "")
-        if not url:
+        targets = _planned_targets(message, payload, target_url)
+        url = target_url or (targets[0].url if targets else "") or str(payload.get("target_url") or "")
+        if not url and not targets:
             raise ValueError("Planner could not determine a target URL from the task.")
+        if not url and targets:
+            raise ValueError("Planner could not determine target URLs from the named sites.")
         from andera.parse import _normalize_target
         from andera.schema import infer_required_columns, infer_row_limit, normalize_column_name
 
@@ -174,6 +203,7 @@ class OpenAIPlanner:
         scope = str(payload.get("screenshot_scope") or "").strip().lower().replace("-", "_")
         if scope not in {"viewport", "full_page"}:
             scope = infer_screenshot_scope(message)
+        roles = _string_list(payload.get("screenshot_roles")) or infer_screenshot_roles(message)
         if timeout_ms is not None:
             resolved_timeout = int(timeout_ms)
         else:
@@ -186,7 +216,7 @@ class OpenAIPlanner:
             required_selector=str(payload.get("required_selector") or ""),
             artifact_types=artifacts,
             timeout_ms=resolved_timeout,
-            expect_rows=bool(payload.get("expect_rows", "csv" in artifacts)),
+            expect_rows=bool(payload.get("expect_rows", "csv" in artifacts)) and "csv" in artifacts,
             subgoals=_string_list(payload.get("subgoals")) or ["open_target", "observe_page", "collect_evidence"],
             evidence_requirements=_with_screenshot_requirement(
                 _string_list(payload.get("evidence_requirements")) or list(artifacts),
@@ -198,6 +228,8 @@ class OpenAIPlanner:
             write_actions_allowed=bool(payload.get("write_actions_allowed", False)),
             row_limit=row_limit,
             screenshot_scope=scope,
+            screenshot_roles=roles,
+            targets=targets,
         )
 
     def decide(
@@ -221,6 +253,8 @@ class OpenAIPlanner:
                     "row_limit": spec.row_limit,
                     "write_actions_allowed": spec.write_actions_allowed,
                     "screenshot_scope": spec.screenshot_scope,
+                    "screenshot_roles": spec.screenshot_roles,
+                    "targets": [{"name": item.name, "url": item.url} for item in spec.targets],
                 },
                 "observation": observation,
                 "screenshot": screenshot_note,
@@ -245,6 +279,8 @@ class OpenAIPlanner:
                 "timeout_ms",
                 "reason",
                 "need_screenshot",
+                "role",
+                "settle",
             )
             if payload.get(key) not in (None, "", False)
         }
@@ -253,6 +289,10 @@ class OpenAIPlanner:
                 args["full_page"] = bool(payload.get("full_page"))
             else:
                 args["full_page"] = spec.screenshot_scope != "viewport"
+            if "role" not in args:
+                missing = _missing_screenshot_role(spec, trajectory)
+                if missing:
+                    args["role"] = missing
         if action_type == "navigate" and "url" not in args:
             args["url"] = spec.target_url
         if action_type in {"wait", "extract_table", "click", "type", "select"} and "selector" not in args:
@@ -336,6 +376,127 @@ def _string_list(value: Any) -> List[str]:
     return [str(value)]
 
 
+def _is_recency_capture(spec: TaskSpec) -> bool:
+    roles = [str(item) for item in spec.screenshot_roles]
+    return "latest_content" in roles or (
+        "screenshot" in spec.artifact_types
+        and "csv" not in spec.artifact_types
+        and (needs_most_recent(spec.raw) or bool(infer_screenshot_roles(spec.raw) == ["homepage", "latest_content"]))
+    )
+
+
+def _decide_recency(
+    spec: TaskSpec,
+    observation: Dict[str, Any],
+    trajectory: Sequence[TrajectoryEvent],
+) -> BrowserAction:
+    roles = spec.screenshot_roles or ["homepage", "latest_content"]
+    url = str(observation.get("url") or "")
+    opened_index = any(event.action == "open_content_index" and event.outcome == "ok" for event in trajectory)
+    opened_recent = any(event.action == "open_most_recent" and event.outcome == "ok" for event in trajectory)
+    if not opened_index and not opened_recent and not _same_page_url(url, spec.target_url):
+        return BrowserAction("navigate", {"url": spec.target_url})
+    if _needs_settle(trajectory):
+        return BrowserAction("wait", {"settle": True, "selector": "body", "timeout_ms": 4000})
+    if "homepage" in roles and _missing_role(trajectory, "homepage"):
+        return BrowserAction(
+            "screenshot",
+            {"full_page": spec.screenshot_scope != "viewport", "role": "homepage"},
+        )
+    if not opened_index and "latest_content" in roles:
+        if observation.get("content_index_links"):
+            return BrowserAction("open_content_index", {})
+        return BrowserAction("report_failed", {"reason": "content_index_not_found"})
+    if opened_index and not opened_recent:
+        if observation.get("list_candidates") or observation.get("has_list"):
+            return BrowserAction("open_most_recent", {})
+        items_visible = any(
+            token in str(observation.get("text_excerpt") or "").lower()
+            for token in ("article", "posted", "published")
+        )
+        if items_visible or observation.get("interactive"):
+            return BrowserAction("open_most_recent", {})
+        return BrowserAction("report_failed", {"reason": "no_dated_content"})
+    if "latest_content" in roles and _missing_role(trajectory, "latest_content"):
+        return BrowserAction(
+            "screenshot",
+            {"full_page": spec.screenshot_scope != "viewport", "role": "latest_content"},
+        )
+    return BrowserAction("done_subgoal", {})
+
+
+def _same_page_url(left: str, right: str) -> bool:
+    return (left or "").rstrip("/") == (right or "").rstrip("/")
+
+
+def _needs_settle(trajectory: Sequence[TrajectoryEvent]) -> bool:
+    for event in reversed(trajectory):
+        if event.action == "wait" and (event.args.get("settle") or event.outcome in {"ok", "skipped"}):
+            return False
+        if event.action in {"navigate", "open_content_index", "open_most_recent", "click"} and event.outcome == "ok":
+            return True
+        if event.action not in {"inspect", "checkpoint"}:
+            return False
+    return False
+
+
+def _missing_screenshot_role(spec: TaskSpec, trajectory: Sequence[TrajectoryEvent]) -> str:
+    if "screenshot" not in spec.artifact_types:
+        return ""
+    roles = list(spec.screenshot_roles) or ["final"]
+    captured = {
+        str(event.args.get("role") or "final")
+        for event in trajectory
+        if event.action == "screenshot" and event.outcome in {"ok", "unavailable"}
+    }
+    for role in roles:
+        if role not in captured:
+            return role
+    return ""
+
+
+def _missing_role(trajectory: Sequence[TrajectoryEvent], role: str) -> bool:
+    return not any(
+        event.action == "screenshot"
+        and event.outcome in {"ok", "unavailable"}
+        and str(event.args.get("role") or "") == role
+        for event in trajectory
+    )
+
+
+def _planned_targets(message: str, payload: Dict[str, Any], operator_url: str | None) -> List[TargetSpec]:
+    names = infer_named_targets(message)
+    raw_targets = payload.get("targets") or []
+    targets: List[TargetSpec] = []
+    if isinstance(raw_targets, list):
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            if not name:
+                name = url
+            homepage = official_homepage(url) if not operator_url else url
+            if operator_url and len(raw_targets) == 1:
+                homepage = operator_url
+            targets.append(TargetSpec(name=name, url=homepage))
+    if names and len(targets) < len(names):
+        by_name = {item.name.lower(): item for item in targets}
+        merged: List[TargetSpec] = []
+        extras = [item for item in targets if item.name.lower() not in {name.lower() for name in names}]
+        for name in names:
+            existing = by_name.get(name.lower())
+            if existing:
+                merged.append(existing)
+        merged.extend(extras)
+        targets = merged
+    if operator_url and len(targets) == 1:
+        targets = [TargetSpec(name=targets[0].name, url=operator_url)]
+    return targets
+
+
 def _with_screenshot_requirement(requirements: List[str], artifacts: List[str]) -> List[str]:
     result = list(requirements)
     if "screenshot" in artifacts and "screenshot" not in result:
@@ -409,6 +570,19 @@ def _plan_schema() -> Dict[str, Any]:
                 "write_actions_allowed": {"type": "boolean"},
                 "row_limit": {"type": "integer"},
                 "screenshot_scope": {"type": "string", "enum": ["viewport", "full_page"]},
+                "screenshot_roles": {"type": "array", "items": {"type": "string"}},
+                "targets": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "name": {"type": "string"},
+                            "url": {"type": "string"},
+                        },
+                        "required": ["name", "url"],
+                    },
+                },
             },
             "required": [
                 "intent",
@@ -425,6 +599,8 @@ def _plan_schema() -> Dict[str, Any]:
                 "write_actions_allowed",
                 "row_limit",
                 "screenshot_scope",
+                "screenshot_roles",
+                "targets",
             ],
         },
     }
@@ -447,6 +623,8 @@ def _action_schema() -> Dict[str, Any]:
                 "reason": {"type": "string"},
                 "need_screenshot": {"type": "boolean"},
                 "full_page": {"type": "boolean"},
+                "role": {"type": "string"},
+                "settle": {"type": "boolean"},
             },
             "required": [
                 "type",
@@ -459,6 +637,8 @@ def _action_schema() -> Dict[str, Any]:
                 "reason",
                 "need_screenshot",
                 "full_page",
+                "role",
+                "settle",
             ],
         },
     }
