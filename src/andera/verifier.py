@@ -13,6 +13,7 @@ from andera.models import (
     VerifierReport,
     worse_status,
 )
+from andera.schema import column_type, is_absolute_http_url, parse_integer, split_unmet_fields
 
 
 def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict] = None) -> VerifierReport:
@@ -33,8 +34,9 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
             status = worse_status(status, downgrade_to)
 
     artifacts = {item.type: item for item in outcome.artifacts}
+    requested_types = {str(item).lower() for item in spec.artifact_types}
 
-    if "html_snapshot" in spec.artifact_types or outcome.html:
+    if "html_snapshot" in requested_types or outcome.html:
         artifact = artifacts.get("html_snapshot")
         ok = artifact is not None and artifact.bytes > 0
         record(
@@ -44,7 +46,7 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
             RunStatus.PARTIAL,
         )
 
-    if "csv" in spec.artifact_types:
+    if "csv" in requested_types:
         artifact = artifacts.get("csv")
         present = artifact is not None
         record(
@@ -68,8 +70,51 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
             "Required columns present" if not missing_cols else f"Missing columns: {missing_cols}",
             RunStatus.PARTIAL,
         )
+        if spec.row_limit > 0:
+            count_ok = len(outcome.rows) == spec.row_limit
+            record(
+                "required_row_count",
+                count_ok,
+                f"Extracted {len(outcome.rows)} of {spec.row_limit} required rows"
+                if count_ok
+                else f"Required {spec.row_limit} rows, extracted {len(outcome.rows)}",
+                RunStatus.PARTIAL,
+            )
+        if spec.required_columns and outcome.rows:
+            unmet_values = split_unmet_fields(outcome.rows, spec.required_columns)
+            record(
+                "required_field_values",
+                not unmet_values,
+                "Required fields are populated"
+                if not unmet_values
+                else f"Required field(s) could not be obtained: {unmet_values}",
+                RunStatus.PARTIAL,
+            )
+            for column in spec.required_columns:
+                kind = column_type(column)
+                invalid = []
+                for index, row in enumerate(outcome.rows):
+                    value = str(row.get(column, "")).strip()
+                    if not value:
+                        continue
+                    if kind == "integer":
+                        ok, _ = parse_integer(value)
+                        if not ok:
+                            invalid.append(index)
+                    elif kind == "absolute_url":
+                        if not is_absolute_http_url(value):
+                            invalid.append(index)
+                if kind in {"integer", "absolute_url"}:
+                    record(
+                        f"column_type:{column}",
+                        not invalid,
+                        f"{column} values match {kind}"
+                        if not invalid
+                        else f"{column} has invalid {kind} values in rows {invalid}",
+                        RunStatus.PARTIAL,
+                    )
 
-    if "screenshot" in spec.artifact_types:
+    if "screenshot" in requested_types:
         artifact = artifacts.get("screenshot")
         ok = artifact is not None and artifact.bytes > 0
         record(
@@ -78,6 +123,24 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
             "Screenshot exists and is nonempty" if ok else "Screenshot was requested but not captured",
             RunStatus.PARTIAL,
         )
+
+    if "download" in requested_types:
+        artifact = artifacts.get("download")
+        present = artifact is not None
+        record(
+            "required_download",
+            present,
+            "Download exists" if present else "Download was requested but no file was captured",
+            RunStatus.PARTIAL,
+        )
+        if present:
+            nonempty = artifact.bytes > 0
+            record(
+                "download_nonempty",
+                nonempty,
+                "Download file is nonempty" if nonempty else "Download file is empty",
+                RunStatus.PARTIAL,
+            )
 
     requested = spec.target_url
     final_url = outcome.final_url or outcome.target_url
@@ -112,6 +175,8 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
         missing = []
         for row_index, row in enumerate(outcome.rows):
             for column, value in row.items():
+                if str(column).startswith("_"):
+                    continue
                 if (row_index, column) not in indexed:
                     missing.append(f"rows[{row_index}].{column}")
                     if len(missing) >= 5:

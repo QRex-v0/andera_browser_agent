@@ -87,7 +87,7 @@ class EvidenceStore:
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = run_dir
         self.evidence_dir = run_dir / "evidence"
-        self.downloads_dir = run_dir / "downloads"
+        self.downloads_dir = self.evidence_dir / "downloads"
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.trace_path = run_dir / "trace.jsonl"

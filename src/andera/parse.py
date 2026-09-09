@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from andera.models import TaskSpec
 from andera.paths import fixture_path, repo_root
+from andera.schema import infer_required_columns, infer_row_limit
 
 DEFAULT_SELECTOR = 'table[data-evidence="access-list"]'
 DEFAULT_TIMEOUT_MS = 8000
@@ -36,10 +37,13 @@ def parse_task(message: str, target_url: str | None = None, timeout_ms: int | No
         )
 
     artifacts = _infer_artifacts(text)
-    selector = _extract_selector(text) or DEFAULT_SELECTOR
+    selector = _extract_selector(text)
+    if not selector:
+        selector = DEFAULT_SELECTOR if _infer_portal_url(text) else ""
     intent = _infer_intent(text)
     timeout = timeout_ms if timeout_ms is not None else _extract_timeout(text)
     expect_rows = "csv" in artifacts
+    row_limit = infer_row_limit(text)
     subgoals = ["open_target", "observe_page", "collect_requested_evidence"]
     return TaskSpec(
         raw=text,
@@ -51,13 +55,14 @@ def parse_task(message: str, target_url: str | None = None, timeout_ms: int | No
         expect_rows=expect_rows,
         subgoals=subgoals,
         evidence_requirements=list(artifacts),
-        required_columns=[],
+        required_columns=infer_required_columns(text),
         completion_criteria=[
             "requested artifacts exist",
             "every output field has provenance",
         ],
-        step_budget=20,
+        step_budget=max(20, 8 + 2 * row_limit),
         write_actions_allowed=False,
+        row_limit=row_limit,
     )
 
 
@@ -73,6 +78,8 @@ def _infer_artifacts(text: str) -> list[str]:
     artifacts = []
     if "csv" in lowered or "spreadsheet" in lowered or "access list" in lowered or "user" in lowered:
         artifacts.append("csv")
+    if "download" in lowered:
+        artifacts.append("download")
     if "screenshot" in lowered or "screen shot" in lowered:
         artifacts.append("screenshot")
     if "html" in lowered or "snapshot" in lowered:
@@ -86,7 +93,16 @@ def _infer_artifacts(text: str) -> list[str]:
 
 def _extract_url(text: str) -> str | None:
     match = re.search(r"(https?://\S+|file://\S+|fixture://\S+)", text)
-    return match.group(1).rstrip(").,") if match else None
+    if match:
+        return match.group(1).rstrip(").,")
+    match = re.search(
+        r"\b(?:go to|open|visit)\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s,]+)?)",
+        text,
+        re.I,
+    )
+    if match:
+        return match.group(1).rstrip(").,")
+    return None
 
 
 def _extract_selector(text: str) -> str | None:
@@ -118,9 +134,12 @@ def _infer_portal_url(text: str) -> str | None:
 
 
 def _normalize_target(url: str) -> str:
+    url = (url or "").strip()
     parsed = urlparse(url)
     if parsed.scheme in {"http", "https", "file", "fixture"}:
         return url
+    if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/[^\s]*)?$", url):
+        return "https://" + url
     path = Path(url)
     if not path.is_absolute():
         path = (repo_root() / path).resolve()

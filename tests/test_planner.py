@@ -52,6 +52,33 @@ def _action(action_type: str, **kwargs: Any) -> str:
     return json.dumps(payload)
 
 
+def test_openai_planner_resolves_url_when_operator_omits_it(out_dir, tmp_path) -> None:
+    from test_list_extract import SPLIT_ROW_HTML
+
+    page = tmp_path / "stories.html"
+    page.write_text(SPLIT_ROW_HTML)
+    target = page.resolve().as_uri()
+    client = ScriptedClient(
+        [
+            _plan_payload(url=target),
+            _action("navigate", url=target),
+            _action("inspect"),
+            _action("extract_table"),
+            _action("done_subgoal"),
+        ]
+    )
+    planner = OpenAIPlanner(client=client, model="test-model")
+    agent = EvidenceAgent(FixtureBrowser(), out_dir, planner=planner)
+    result = agent.run("Create a CSV of the top 5 stories with title, URL, and points")
+
+    assert result.task.target_url == target
+    assert result.task.required_columns == ["title", "url", "points"]
+    assert result.task.row_limit == 5
+    assert result.status == RunStatus.SUCCESS
+    assert result.metadata["row_count"] == 5
+    assert all(json.loads(item).get("type") == "done_subgoal" for item in client.outputs)
+
+
 def test_openai_planner_is_mocked_and_does_not_need_portal_wording(out_dir) -> None:
     target = fixture_path("portals", "access-review.html").resolve().as_uri()
     client = ScriptedClient(

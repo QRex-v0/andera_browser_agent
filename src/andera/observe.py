@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from andera.html_query import parse_html, query, table_to_rows
+from andera.list_extract import preview_records
 
 
 def observation_from_html(url: str, html: str) -> Dict[str, Any]:
@@ -11,9 +12,12 @@ def observation_from_html(url: str, html: str) -> Dict[str, Any]:
             "url": url,
             "title": "",
             "has_table": False,
+            "has_list": False,
             "has_password": False,
             "tables": [],
+            "list_candidates": [],
             "interactive": [],
+            "status_controls": [],
             "text_excerpt": "",
         }
     root = parse_html(html)
@@ -34,29 +38,40 @@ def observation_from_html(url: str, html: str) -> Dict[str, Any]:
             }
         )
     interactive: List[Dict[str, str]] = []
+    status_controls: List[Dict[str, str]] = []
     for tag in ("a", "button", "input", "select", "textarea"):
         for node in query(root, tag):
             input_type = node.attrs.get("type", "")
-            interactive.append(
-                {
-                    "tag": tag,
-                    "type": input_type,
-                    "name": node.attrs.get("name", ""),
-                    "id": node.attrs.get("id", ""),
-                    "text": "" if input_type == "password" else node.text[:80],
-                }
-            )
-            if len(interactive) >= 40:
+            href = node.attrs.get("href", "")
+            text = "" if input_type == "password" else node.text[:80]
+            item = {
+                "tag": tag,
+                "type": input_type,
+                "name": node.attrs.get("name", ""),
+                "id": node.attrs.get("id", ""),
+                "text": text,
+                "href": href[:200],
+            }
+            lowered = f"{text} {href}".lower()
+            if any(token in lowered for token in ("merged", "closed", "draft", "pull")) and len(status_controls) < 15:
+                status_controls.append(item)
+            if text.strip() or href:
+                interactive.append(item)
+            if len(interactive) >= 60:
                 break
-        if len(interactive) >= 40:
+        if len(interactive) >= 60:
             break
+    preview = preview_records(html, url)
     return {
         "url": url,
         "title": titles[0].text if titles else "",
         "has_table": bool(tables),
+        "has_list": bool(preview),
         "has_password": any(item.get("type") == "password" for item in interactive),
         "tables": tables,
+        "list_candidates": preview,
         "interactive": interactive,
+        "status_controls": status_controls,
         "text_excerpt": root.text[:1500],
     }
 

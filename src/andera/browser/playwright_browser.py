@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+from typing import Any
 
 SETUP_COMMAND = "make setup"
 
@@ -11,6 +13,10 @@ class PlaywrightBrowser:
     VIEWPORT = {"width": 1280, "height": 720}
     LOCALE = "en-US"
     TIMEZONE = "UTC"
+    USER_AGENT = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
 
     def __init__(self, headless: bool = True) -> None:
         try:
@@ -30,6 +36,13 @@ class PlaywrightBrowser:
             )
         try:
             self._browser = self._playwright.chromium.launch(headless=headless)
+            self._context = self._browser.new_context(
+                viewport=self.VIEWPORT,
+                locale=self.LOCALE,
+                timezone_id=self.TIMEZONE,
+                user_agent=self.USER_AGENT,
+            )
+            self._page = self._context.new_page()
         except Exception as exc:
             self._playwright_cm.__exit__(None, None, None)
             message = str(exc)
@@ -40,15 +53,13 @@ class PlaywrightBrowser:
             raise RuntimeError(
                 f"Failed to launch Playwright Chromium. Run: {SETUP_COMMAND}"
             ) from None
-        self._context = self._browser.new_context(
-            viewport=self.VIEWPORT,
-            locale=self.LOCALE,
-            timezone_id=self.TIMEZONE,
-        )
-        self._page = self._context.new_page()
 
     def goto(self, url: str) -> None:
         self._page.goto(url, wait_until="domcontentloaded")
+        try:
+            self._page.wait_for_load_state("load", timeout=15000)
+        except Exception:
+            pass
 
     def wait_for(self, selector: str, timeout_ms: int) -> None:
         self._page.wait_for_selector(selector, timeout=timeout_ms)
@@ -61,6 +72,30 @@ class PlaywrightBrowser:
 
     def click(self, selector: str) -> None:
         self._page.click(selector, timeout=5000)
+
+    def download(
+        self,
+        selector: str,
+        destination_dir: str,
+        match_text: str = "",
+        match_date: str = "",
+    ) -> str:
+        destination = Path(destination_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        locator = self._page.locator(selector)
+        count = locator.count()
+        if count == 0:
+            with self._page.expect_download(timeout=15000) as info:
+                self._page.click(selector, timeout=5000)
+        else:
+            target = _best_download_target(locator, match_text, match_date)
+            with self._page.expect_download(timeout=20000) as info:
+                target.click(timeout=5000)
+        download = info.value
+        filename = _sanitize_filename(download.suggested_filename) or "download"
+        path = destination / _next_available_path(destination, filename)
+        download.save_as(path)
+        return str(path.resolve())
 
     def type_text(self, selector: str, text: str) -> None:
         self._page.fill(selector, text, timeout=5000)
@@ -97,6 +132,7 @@ class PlaywrightBrowser:
             "viewport": dict(self.VIEWPORT),
             "locale": self.LOCALE,
             "timezone": self.TIMEZONE,
+            "user_agent": self.USER_AGENT,
         }
 
     def close(self) -> None:
@@ -124,3 +160,57 @@ def _compact_a11y(node, depth: int = 0, limit: list | None = None) -> dict | Non
     if children:
         compact["children"] = children
     return compact
+
+
+def _best_download_target(locator, match_text: str, match_date: str):
+    if match_text == "" and match_date == "":
+        return locator
+    preferred: Any | None = None
+    best = -1
+    total = locator.count()
+    for index in range(total):
+        element = locator.nth(index)
+        try:
+            text = element.inner_text(timeout=750).strip().lower()
+        except Exception:
+            text = ""
+        if not text:
+            try:
+                text = (element.get_attribute("href") or "").strip().lower()
+            except Exception:
+                text = ""
+        score = 0
+        if match_text and match_text.lower() in text:
+            score += 2
+        if match_date and match_date.lower() in text:
+            score += 1
+        if score > best:
+            preferred = element
+            best = score
+            if score >= 3:
+                break
+    if preferred is not None:
+        return preferred
+    return locator
+
+
+def _next_available_path(base: Path, filename: str) -> str:
+    safe_name = _sanitize_filename(filename)
+    candidate = base / safe_name
+    if not candidate.exists():
+        return safe_name
+    stem = candidate.stem
+    suffix = candidate.suffix
+    index = 1
+    while True:
+        candidate = base / f"{stem}-{index}{suffix}"
+        if not candidate.exists():
+            return candidate.name
+        index += 1
+
+
+def _sanitize_filename(name: str) -> str:
+    name = name.strip() or "download"
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = re.sub(r"\\s+", "-", name).strip("._- ")
+    return name or "download"

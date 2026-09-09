@@ -49,6 +49,11 @@ class FixtureBrowser:
             "FixtureBrowser cannot capture pixels. Use --browser playwright for screenshots."
         )
 
+    def download(self, selector: str, destination_dir: str, match_text: str = "", match_date: str = "") -> str:
+        raise NotImplementedError(
+            "FixtureBrowser cannot perform downloads. Use --browser playwright."
+        )
+
     def current_url(self) -> str:
         return self._url
 

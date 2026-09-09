@@ -6,6 +6,9 @@ from html.parser import HTMLParser
 from typing import Dict, List, Optional, Union
 
 
+SKIP_TEXT_TAGS = {"script", "style", "noscript", "template"}
+
+
 class _Node:
     def __init__(self, tag: str, attrs: Dict[str, str]) -> None:
         self.tag = tag
@@ -22,6 +25,18 @@ class _Node:
             else:
                 bits.append(item.text)
         return re.sub(r"\s+", " ", "".join(bits)).strip()
+
+
+def node_visible_text(node: _Node) -> str:
+    if node.tag in SKIP_TEXT_TAGS:
+        return ""
+    bits: List[str] = []
+    for item in node.content:
+        if isinstance(item, str):
+            bits.append(item)
+        else:
+            bits.append(node_visible_text(item))
+    return re.sub(r"\s+", " ", " ".join(bit for bit in bits if bit)).strip()
 
 
 class _Selector:

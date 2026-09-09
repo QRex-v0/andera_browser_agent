@@ -16,6 +16,15 @@ class BrowserSession(Protocol):
     def screenshot(self, path: str) -> None:
         """Write a PNG screenshot to path, or raise if unsupported."""
 
+    def download(
+        self,
+        selector: str,
+        destination_dir: str,
+        match_text: str = "",
+        match_date: str = "",
+    ) -> str:
+        """Trigger a download from `selector` and save it into `destination_dir`."""
+
     def current_url(self) -> str:
         """Return the last successfully opened URL."""
 

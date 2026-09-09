@@ -19,6 +19,7 @@ class ArtifactType(str, Enum):
     CSV = "csv"
     SCREENSHOT = "screenshot"
     HTML_SNAPSHOT = "html_snapshot"
+    DOWNLOAD = "download"
     METADATA = "metadata"
     PROVENANCE = "provenance"
     REPORT = "report"
@@ -46,6 +47,7 @@ class TaskSpec:
     completion_criteria: List[str] = field(default_factory=list)
     step_budget: int = 20
     write_actions_allowed: bool = False
+    row_limit: int = 0
 
 
 EvidenceTask = TaskSpec

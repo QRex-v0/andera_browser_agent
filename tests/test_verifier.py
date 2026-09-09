@@ -152,6 +152,40 @@ def test_verifier_accepts_same_host_and_path() -> None:
     assert any(check.code == "source_host" and check.passed for check in report.checks)
 
 
+def test_verifier_rejects_wrong_row_count_and_non_integer_points() -> None:
+    rows = [
+        {"title": "A", "url": "https://a.example/", "points": "12 points"},
+        {"title": "B", "url": "not-a-url", "points": "3"},
+    ]
+    report = verify(
+        _spec(required_columns=["title", "url", "points"], row_limit=5),
+        _outcome(
+            rows=rows,
+            columns=["title", "url", "points"],
+            artifacts=[
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+            ],
+        ),
+        provenance={
+            "fields": [
+                {
+                    "path": f"csv.rows[{index}].{column}",
+                    "value": row[column],
+                    "evidence_refs": ["sha256:ab"],
+                    "source_locator": {"row": index, "column": column},
+                }
+                for index, row in enumerate(rows)
+                for column in row
+            ]
+        },
+    )
+    assert report.status == RunStatus.PARTIAL
+    assert any(check.code == "required_row_count" and not check.passed for check in report.checks)
+    assert any(check.code == "column_type:points" and not check.passed for check in report.checks)
+    assert any(check.code == "column_type:url" and not check.passed for check in report.checks)
+
+
 def test_verifier_never_upgrades_timeout() -> None:
     report = verify(
         _spec(),
