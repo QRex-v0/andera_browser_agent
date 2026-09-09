@@ -28,6 +28,8 @@ def test_parse_class_selector() -> None:
         "Collect the current user access list from the access review portal as CSV using selector .access-table"
     )
     assert task.required_selector == ".access-table"
+    assert isinstance(task.subgoals, list)
+    assert task.write_actions_allowed is False
 
 
 def test_parse_rejects_empty_task() -> None:

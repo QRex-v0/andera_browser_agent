@@ -10,14 +10,17 @@ An auditor-style natural-language task such as:
 Collect the current user access list from the access review portal as CSV
 ```
 
-is parsed into a structured `EvidenceTask`, executed against a local HTML fixture (or Playwright), and written to a run directory:
+is parsed into a structured `TaskSpec`, executed against a local HTML fixture (or Playwright), independently verified, and written to a run directory:
 
-- `access_list.csv` — extracted entitlement table
-- `page.html` — HTML snapshot at collection time
-- `result.json` — status, timings, artifact paths, and errors
-- `screenshot.png` — only when `--browser playwright` is used and a screenshot is requested
+- `evidence/extracted-table.csv` — extracted table
+- `evidence/page-final.html` — HTML snapshot at collection time
+- `evidence/screenshot-final.png` — when a screenshot is requested and the backend can capture pixels
+- `provenance.json` — SHA-256 manifests and field-level evidence links
+- `trace.jsonl` — action trajectory
+- `report.html` — static reviewer report
+- `result.json` — status, timings, artifact paths, verifier checks, and errors
 
-Statuses are explicit: `success`, `incomplete`, `timeout`, or `failed`. Incomplete or timed-out runs never report `success`.
+Statuses are explicit: `success`, `partial`, `blocked`, `timeout`, or `failed`. Missing evidence never reports `success`.
 
 ## Setup
 
@@ -63,10 +66,15 @@ python -m pytest
 The suite covers:
 
 - Successful access-list collection from `fixtures/portals/access-review.html`
-- Incomplete evidence when the table is present but empty
+- Generic table extraction from a second fixture (not the access-review portal)
+- Incomplete evidence when the table is present but empty (`partial`)
 - Timeout when the required table never appears
 - Navigation failure for a missing file
-- Screenshot requested on the fixture backend (must be `incomplete`, not silent success)
+- Authentication wall reported as `blocked`
+- Screenshot requested on the fixture backend (must be `partial`, not silent success)
+- Real Playwright Chromium collection of CSV + screenshot when the browser extra is installed
+
+The broader capability ladder and the machine-scoring contract live in [`evals/catalog.json`](evals/catalog.json) and [`evals/README.md`](evals/README.md). The catalog contains twelve visible development tasks across four difficulty levels. Gold answers belong in evaluator-only oracles, not in the agent's working tree.
 
 ## Design notes
 
@@ -104,13 +112,13 @@ Some site-shaped knowledge is legitimate. Discovering an available API or learni
 ## Assumptions
 
 - The first workflow is a **read-only access-review table**, standing in for Workday/NetSuite/GitHub entitlement exports.
-- Known portal names (`access review`, `empty access`, `missing table`) map to local fixtures. Other tasks need `--url`.
-- The fixture backend cannot produce pixels. Requesting a screenshot there is reported as incomplete evidence.
+- Known portal names (`access review`, `empty access`, `missing table`, `blocked login`) map to local fixtures. Other tasks need `--url`.
+- The fixture backend cannot produce pixels. Requesting a screenshot there is reported as `partial`, not success.
 
 ## Limitations
 
 - No live enterprise SSO, auth, or anti-bot handling.
 - Natural-language coverage is narrow (access-list collection plus explicit URL/selector/timeout phrases).
-- Playwright is implemented but not required for the default test path.
+- Playwright Chromium is covered by end-to-end tests when the `browser` extra is installed; fixture tests remain the default fast path.
 - One task per process; no queue, retry policy, or multi-page workflows yet.
 - Generalization CI, sealed holdout evaluation, and cold-start/warm-start comparison are design requirements above, not implemented in this first slice.

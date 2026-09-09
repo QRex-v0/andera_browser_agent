@@ -52,6 +52,15 @@ class FixtureBrowser:
     def current_url(self) -> str:
         return self._url
 
+    def environment(self) -> dict:
+        return {
+            "name": "fixture",
+            "version": "local-html",
+            "viewport": {"width": 1280, "height": 720},
+            "locale": "en-US",
+            "timezone": "UTC",
+        }
+
     def close(self) -> None:
         self._html = ""
         self._url = ""
