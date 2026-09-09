@@ -122,6 +122,8 @@ class ExecutionOutcome:
     finished_at: str
     duration_ms: int
     environment: Dict[str, Any] = field(default_factory=dict)
+    requested_url: str = ""
+    final_url: str = ""
 
 
 @dataclass
