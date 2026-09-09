@@ -92,7 +92,7 @@ Python 3.9+ is required. Common run path:
 make setup
 source .venv/bin/activate
 python -m andera run "Create a CSV of the top 5 stories on Hacker News with title, URL, and points, and take a full page screenshot" --browser playwright
-python -m andera run "Collect an availability check for Figma, GitHub, and Atlassian. Return a CSV with Company, Observed Status, Final URL, and Evidence Reference. Capture screenshots for each site." --browser playwright --planner openai
+python -m andera run "For Notion, Figma, and 8Sleep, take a screenshot of the website, as well as a screenshot of the most recent press/media/blog/content released by them to show the company is still alive" --browser playwright
 ```
 
 Switch to fixture execution for deterministic local validation when needed. In all modes, failures should include explicit status, artifact paths, and verifier findings.
