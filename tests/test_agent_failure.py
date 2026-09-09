@@ -7,14 +7,15 @@ from andera.models import RunStatus
 from andera.parse import parse_task
 
 
-def test_empty_table_is_incomplete(agent: EvidenceAgent) -> None:
+def test_empty_table_is_partial(agent: EvidenceAgent) -> None:
     result = agent.run("Collect the user access list from the empty access portal as CSV")
 
-    assert result.status == RunStatus.INCOMPLETE
+    assert result.status == RunStatus.PARTIAL
     assert any(issue.code == "missing_evidence" for issue in result.errors)
     assert result.metadata["row_count"] == 0
     csv_artifact = next(item for item in result.artifacts if item.type == "csv")
     assert Path(csv_artifact.path).exists()
+    assert result.status != RunStatus.SUCCESS
 
 
 def test_missing_table_times_out(agent: EvidenceAgent) -> None:
@@ -44,7 +45,17 @@ def test_requested_screenshot_is_not_silently_dropped(agent: EvidenceAgent) -> N
         "Collect the user access list from the access review portal as CSV and a screenshot"
     )
 
-    assert result.status == RunStatus.INCOMPLETE
+    assert result.status == RunStatus.PARTIAL
     assert any(issue.code == "incomplete_evidence" for issue in result.errors)
     assert any(item.type == "csv" for item in result.artifacts)
     assert all(item.type != "screenshot" for item in result.artifacts)
+    assert result.status != RunStatus.SUCCESS
+
+
+def test_login_wall_is_blocked(agent: EvidenceAgent) -> None:
+    result = agent.run("Collect the user access list from the blocked login portal as CSV")
+
+    assert result.status == RunStatus.BLOCKED
+    assert any(issue.code == "blocked" for issue in result.errors)
+    assert all(item.type != "csv" for item in result.artifacts)
+    assert result.status != RunStatus.SUCCESS

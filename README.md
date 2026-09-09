@@ -10,49 +10,47 @@ An auditor-style natural-language task such as:
 Collect the current user access list from the access review portal as CSV
 ```
 
-is parsed into a structured `EvidenceTask`, executed against a local HTML fixture (or Playwright), and written to a run directory:
+is parsed into a structured `TaskSpec`, executed against a local HTML fixture (or Playwright), independently verified, and written to a run directory:
 
-- `access_list.csv` — extracted entitlement table
-- `page.html` — HTML snapshot at collection time
-- `result.json` — status, timings, artifact paths, and errors
-- `screenshot.png` — only when `--browser playwright` is used and a screenshot is requested
+- `evidence/extracted-table.csv` — extracted table
+- `evidence/page-final.html` — HTML snapshot at collection time
+- `evidence/screenshot-final.png` — when a screenshot is requested and the backend can capture pixels
+- `provenance.json` — SHA-256 manifests and field-level evidence links
+- `trace.jsonl` — action trajectory
+- `report.html` — static reviewer report
+- `result.json` — status, timings, artifact paths, verifier checks, and errors
 
-Statuses are explicit: `success`, `incomplete`, `timeout`, or `failed`. Incomplete or timed-out runs never report `success`.
+Statuses are explicit: `success`, `partial`, `blocked`, `timeout`, or `failed`. Missing evidence never reports `success`.
 
 ## Setup
 
-Python 3.9+ is required. From the repo root:
+Python 3.9+ is required. The only supported setup is:
 
 ```bash
-python3 -m venv .venv
+make setup
 source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -e ".[dev]"
 ```
 
-Optional real-browser backend:
-
-```bash
-pip install -e ".[dev,browser]"
-playwright install chromium
-```
+That target creates `.venv`, installs the pinned dependencies from `requirements.txt` (`playwright==1.60.0`), and runs `playwright install chromium`. Do not install Playwright or Chromium by a separate ad-hoc command.
 
 ## Run
 
 Fixture backend (default, no Chromium, deterministic):
 
 ```bash
-python -m andera run "Collect the current user access list from the access review portal as CSV"
+python -m andera run "Collect the current user access list from the access review portal as CSV" --planner rule --browser fixture
 ```
 
 Override the target or backend:
 
 ```bash
-python -m andera run "Collect the access list as CSV" --url fixtures/portals/access-review.html
-python -m andera run "Collect the access list as CSV and a screenshot" --browser playwright
+python -m andera run "Collect the access list as CSV" --url fixtures/portals/access-review.html --planner rule --browser fixture
+python -m andera run "Collect the access list as CSV and a screenshot" --planner rule --browser playwright
 ```
 
 Exit code `0` means `success`. Any other status prints JSON and exits `1`. Parse/setup errors exit `2`.
+
+Production default is `--planner openai --browser playwright`. It reads `OPENAI_API_KEY` and `OPENAI_MODEL` from the process environment or `environment/.env.local`. Pass `--url` for unseen pages; do not put credentials in the task text.
 
 ## Tests
 
@@ -63,10 +61,15 @@ python -m pytest
 The suite covers:
 
 - Successful access-list collection from `fixtures/portals/access-review.html`
-- Incomplete evidence when the table is present but empty
+- Generic table extraction from a second fixture (not the access-review portal)
+- Incomplete evidence when the table is present but empty (`partial`)
 - Timeout when the required table never appears
 - Navigation failure for a missing file
-- Screenshot requested on the fixture backend (must be `incomplete`, not silent success)
+- Authentication wall reported as `blocked`
+- Screenshot requested on the fixture backend (must be `partial`, not silent success)
+- Real Playwright Chromium collection of CSV + screenshot when the browser extra is installed
+
+The broader capability ladder and the machine-scoring contract live in [`evals/catalog.json`](evals/catalog.json), [`evals/adversarial_catalog.json`](evals/adversarial_catalog.json), and [`evals/README.md`](evals/README.md). The catalogs contain twelve clean tasks across four difficulty levels and twenty matched adversarial cases. Gold answers belong in evaluator-only oracles, not in the agent's working tree.
 
 ## Design notes
 
@@ -104,13 +107,13 @@ Some site-shaped knowledge is legitimate. Discovering an available API or learni
 ## Assumptions
 
 - The first workflow is a **read-only access-review table**, standing in for Workday/NetSuite/GitHub entitlement exports.
-- Known portal names (`access review`, `empty access`, `missing table`) map to local fixtures. Other tasks need `--url`.
-- The fixture backend cannot produce pixels. Requesting a screenshot there is reported as incomplete evidence.
+- Known portal names (`access review`, `empty access`, `missing table`, `blocked login`) map to local fixtures. Other tasks need `--url`.
+- The fixture backend cannot produce pixels. Requesting a screenshot there is reported as `partial`, not success.
 
 ## Limitations
 
 - No live enterprise SSO, auth, or anti-bot handling.
 - Natural-language coverage is narrow (access-list collection plus explicit URL/selector/timeout phrases).
-- Playwright is implemented but not required for the default test path.
+- Playwright Chromium is installed only via `make setup`; missing browsers fail fast and tell you to run that command.
 - One task per process; no queue, retry policy, or multi-page workflows yet.
 - Generalization CI, sealed holdout evaluation, and cold-start/warm-start comparison are design requirements above, not implemented in this first slice.

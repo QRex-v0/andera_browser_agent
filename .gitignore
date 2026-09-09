@@ -9,6 +9,10 @@ dist/
 build/
 runs/
 .andera/
+.env
+.env.*
+!.env.example
+environment/.env.local
 .DS_Store
 *.png
 !fixtures/**/*.png

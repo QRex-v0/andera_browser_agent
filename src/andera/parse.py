@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict
 from urllib.parse import urlparse
 
-from andera.models import EvidenceTask
+from andera.models import TaskSpec
 from andera.paths import fixture_path, repo_root
 
 DEFAULT_SELECTOR = 'table[data-evidence="access-list"]'
@@ -18,10 +18,12 @@ PORTAL_FIXTURES: Dict[str, Path] = {
     "empty access portal": fixture_path("portals", "empty-access.html"),
     "missing table": fixture_path("portals", "missing-table.html"),
     "missing table portal": fixture_path("portals", "missing-table.html"),
+    "blocked login": fixture_path("portals", "blocked-login.html"),
+    "blocked login portal": fixture_path("portals", "blocked-login.html"),
 }
 
 
-def parse_task(message: str, target_url: str | None = None, timeout_ms: int | None = None) -> EvidenceTask:
+def parse_task(message: str, target_url: str | None = None, timeout_ms: int | None = None) -> TaskSpec:
     text = message.strip()
     if not text:
         raise ValueError("Task message is empty")
@@ -30,20 +32,32 @@ def parse_task(message: str, target_url: str | None = None, timeout_ms: int | No
     if not url:
         raise ValueError(
             "Could not determine a target. Name a known portal "
-            "(access review, empty access, missing table) or pass --url."
+            "(access review, empty access, missing table, blocked login) or pass --url."
         )
 
     artifacts = _infer_artifacts(text)
     selector = _extract_selector(text) or DEFAULT_SELECTOR
     intent = _infer_intent(text)
-    return EvidenceTask(
+    timeout = timeout_ms if timeout_ms is not None else _extract_timeout(text)
+    expect_rows = "csv" in artifacts
+    subgoals = ["open_target", "observe_page", "collect_requested_evidence"]
+    return TaskSpec(
         raw=text,
         intent=intent,
         target_url=_normalize_target(url),
         required_selector=selector,
         artifact_types=artifacts,
-        timeout_ms=timeout_ms if timeout_ms is not None else _extract_timeout(text),
-        expect_rows=True,
+        timeout_ms=timeout,
+        expect_rows=expect_rows,
+        subgoals=subgoals,
+        evidence_requirements=list(artifacts),
+        required_columns=[],
+        completion_criteria=[
+            "requested artifacts exist",
+            "every output field has provenance",
+        ],
+        step_budget=20,
+        write_actions_allowed=False,
     )
 
 
