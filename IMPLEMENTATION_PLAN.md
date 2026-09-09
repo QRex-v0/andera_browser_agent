@@ -411,6 +411,7 @@ PR #4 is merged. This checkpoint completes the §4 MVP critical path on a follow
 ### Shipped
 
 - Branch: `cursor/mvp-evidence-loop`
+- PR: https://github.com/QRex-v0/andera_browser_agent/pull/17
 - Package: `andera` (Python 3.9; Playwright optional extra)
 - CLI: `python -m andera run "<natural-language task>"`
 - Planner emits typed `TaskSpec` (keyword parser, no LLM)
