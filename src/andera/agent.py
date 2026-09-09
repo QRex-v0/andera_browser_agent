@@ -255,6 +255,8 @@ def _execute_targets(
                 "content_index_url": (outcome.metadata or {}).get("content_index_url", ""),
                 "latest_content_url": (outcome.metadata or {}).get("latest_content_url", ""),
                 "latest_content_date": (outcome.metadata or {}).get("latest_content_date", ""),
+                "recency_ambiguity": (outcome.metadata or {}).get("recency_ambiguity", ""),
+                "latest_content_selection": (outcome.metadata or {}).get("latest_content_selection", ""),
                 "undated_items": (outcome.metadata or {}).get("undated_items", []),
                 "screenshots": [
                     {"path": item.path, "sha256": item.sha256, "description": item.description}

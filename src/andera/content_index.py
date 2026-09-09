@@ -120,10 +120,14 @@ def iter_content_items(html: str, page_url: str) -> List[ContentItem]:
 def resolve_most_recent(items: Sequence[ContentItem]) -> MostRecent:
     dated = [item for item in items if item.dated and item.date]
     undated = [item for item in items if not item.dated]
-    dated.sort(key=lambda item: item.date, reverse=True)
+    if not items:
+        return MostRecent(item=None, undated=[], reason="no_dated_content")
     if not dated:
-        return MostRecent(item=None, undated=list(undated), reason="no_dated_content")
-    return MostRecent(item=dated[0], undated=list(undated), reason="")
+        return MostRecent(item=items[0], undated=list(items), reason="dates_unavailable")
+    newest = max(item.date for item in dated)
+    tied = [item for item in items if item.dated and item.date == newest]
+    reason = "date_tie" if len(tied) > 1 else ""
+    return MostRecent(item=tied[0], undated=list(undated), reason=reason)
 
 
 def _record_date(record) -> str:

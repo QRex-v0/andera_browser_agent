@@ -67,7 +67,7 @@ Choose only the next single action from the current observation. Do not emit a f
 If a required control is missing, wait once for asynchronously rendered content before concluding it is absent.
 If a newsroom, press, media, blog, or content index is required, follow a link that is visible in the observation, including footer and menu links. Do not invent a path. If content_index_links names one, use that. If the destination URL is already known, emit navigate with that url — do not click a footer or in-page link just to reach it. If you cannot name the link from its visible text, report_failed — do not click a guess.
 report_blocked only when the site stopped us (authentication, 403, terms, captcha). If we can see the page but lack a way to proceed, report_failed.
-If the most recent item is required, rank dated items by parsed date, not document order. An item without a date is undated, not old. If no dated item exists after waiting, report_failed.
+If the most recent item is required, rank dated items by parsed date, not document order. An item without a date is undated, not old. If two or more candidates cannot be ordered by date, do not revisit them to compare. Record that the dates could not be obtained, pick the first in document order, screenshot that page, and leave the ambiguity in the output. Re-reading a page already in the trajectory does not produce a new date. Do not reopen a URL that already appears in the trajectory.
 Identify an element by what it says, not by where it sits in the markup. A click, type, or select locator must name one element — role plus accessible name, or visible link/button text (for example a:has-text("Blog") or role=link[name="Newsroom"]). A bare tag name such as a, div, button, or span is not a locator and is not acceptable. Do not use site-specific CSS paths or nth-child guesses.
 Read-only: do not submit, approve, purchase, delete, or type into password fields.
 If list_candidates is nonempty, do not wait for a table; emit extract_table or extract_list.
@@ -408,15 +408,7 @@ def _decide_recency(
             return BrowserAction("open_content_index", {})
         return BrowserAction("report_failed", {"reason": "content_index_not_found"})
     if opened_index and not opened_recent:
-        if observation.get("list_candidates") or observation.get("has_list"):
-            return BrowserAction("open_most_recent", {})
-        items_visible = any(
-            token in str(observation.get("text_excerpt") or "").lower()
-            for token in ("article", "posted", "published")
-        )
-        if items_visible or observation.get("interactive"):
-            return BrowserAction("open_most_recent", {})
-        return BrowserAction("report_failed", {"reason": "no_dated_content"})
+        return BrowserAction("open_most_recent", {})
     if "latest_content" in roles and _missing_role(trajectory, "latest_content"):
         return BrowserAction(
             "screenshot",

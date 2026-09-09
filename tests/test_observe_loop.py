@@ -4,7 +4,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from andera.agent import EvidenceAgent
-from andera.executor import _click_destination, _href_from_html, _is_vague_locator
+from andera.executor import (
+    _click_destination,
+    _href_from_html,
+    _is_vague_locator,
+    _observation_loop,
+)
 from andera.models import BrowserAction, RunStatus, TaskSpec
 from andera.observe import observation_from_html
 from andera.planner import DECIDE_INSTRUCTIONS, RulePlanner
@@ -126,6 +131,8 @@ def test_vague_locator_rejects_bare_tags_but_allows_named_controls() -> None:
     )
     assert "bare tag name" in DECIDE_INSTRUCTIONS
     assert "what it says" in DECIDE_INSTRUCTIONS
+    assert "do not revisit them" in DECIDE_INSTRUCTIONS
+    assert "first in document order" in DECIDE_INSTRUCTIONS
 
 
 def test_click_with_known_url_navigates_instead_of_clicking(tmp_path: Path, out_dir: Path) -> None:
@@ -231,17 +238,151 @@ def test_repeated_digest_fails_stuck_and_keeps_homepage(tmp_path: Path, out_dir:
     assert "latest_content" in result.metadata.get("unmet_requirements", [])
 
 
+def test_observation_loop_is_action_agnostic() -> None:
+    assert _observation_loop([], "A") == ""
+    assert _observation_loop(["A"], "A") == ""
+    assert _observation_loop(["A", "A"], "A") == "repeat"
+    assert _observation_loop(["A", "B"], "A") == "revisit"
+    assert _observation_loop(["A", "B", "A"], "B") == "revisit"
+    assert _observation_loop(["A", "B"], "C") == ""
+
+
+class OscillatePostsPlanner:
+    name = "oscillate-posts"
+
+    def __init__(self, first: str, second: str) -> None:
+        self.first = first
+        self.second = second
+        self.toggle = False
+
+    def plan(self, message: str, target_url: str | None = None, timeout_ms: int | None = None):
+        return parse_task(message, target_url=target_url, timeout_ms=timeout_ms)
+
+    def decide(self, spec, observation, trajectory, screenshot_note: str = ""):
+        if not any(event.action == "navigate" and event.outcome == "ok" for event in trajectory):
+            return BrowserAction("navigate", {"url": spec.target_url})
+        if not any(
+            event.action == "screenshot" and event.outcome == "ok" and event.args.get("role") == "homepage"
+            for event in trajectory
+        ):
+            return BrowserAction("screenshot", {"role": "homepage", "full_page": True})
+        self.toggle = not self.toggle
+        return BrowserAction("navigate", {"url": self.first if self.toggle else self.second})
+
+
+def test_navigate_oscillation_is_a_loop(tmp_path: Path, out_dir: Path) -> None:
+    home = (tmp_path / "home.html").resolve().as_uri()
+    first = (tmp_path / "first.html").resolve().as_uri()
+    second = (tmp_path / "second.html").resolve().as_uri()
+    (tmp_path / "home.html").write_text(
+        f'<html><body><h1>Home</h1><nav><a href="{first}">Blog</a></nav></body></html>',
+        encoding="utf-8",
+    )
+    (tmp_path / "first.html").write_text(
+        "<html><body><article><h1>Biological age</h1></article></body></html>",
+        encoding="utf-8",
+    )
+    (tmp_path / "second.html").write_text(
+        "<html><body><article><h1>Player profile</h1></article></body></html>",
+        encoding="utf-8",
+    )
+    pages = {
+        home: (tmp_path / "home.html").read_text(encoding="utf-8"),
+        first: (tmp_path / "first.html").read_text(encoding="utf-8"),
+        second: (tmp_path / "second.html").read_text(encoding="utf-8"),
+    }
+    spec = replace(
+        parse_task("Take a screenshot of the website and the most recent content", target_url=home),
+        target_url=home,
+        artifact_types=["screenshot", "html_snapshot"],
+        screenshot_roles=["homepage", "latest_content"],
+        expect_rows=False,
+        required_columns=[],
+        step_budget=20,
+    )
+    result = EvidenceAgent(
+        ScriptedBrowser(pages), out_dir, planner=OscillatePostsPlanner(first, second)
+    ).run(spec)
+    navigates = [
+        event
+        for event in result.trajectory
+        if event.action == "navigate" and event.outcome == "ok" and event.args.get("url") in {first, second}
+    ]
+    assert len(navigates) < 8
+    assert len(result.trajectory) < 16
+    assert any(event.args.get("loop") in {"revisit", "cycle"} for event in result.trajectory)
+    shots = [item for item in result.artifacts if item.type == "screenshot"]
+    assert any("homepage" in item.description for item in shots)
+    assert any("latest content" in item.description for item in shots)
+
+
+def test_undated_posts_pick_document_order_once(tmp_path: Path, out_dir: Path) -> None:
+    home = (tmp_path / "home.html").resolve().as_uri()
+    blog = (tmp_path / "blog.html").resolve().as_uri()
+    first = (tmp_path / "first.html").resolve().as_uri()
+    second = (tmp_path / "second.html").resolve().as_uri()
+    (tmp_path / "home.html").write_text(
+        f'<html><body><h1>Home</h1><nav><a href="{blog}">Blog</a></nav></body></html>',
+        encoding="utf-8",
+    )
+    (tmp_path / "blog.html").write_text(
+        f"""<html><body>
+        <article><a href="{first}">Biological age</a></article>
+        <article><a href="{second}">Player profile</a></article>
+        </body></html>""",
+        encoding="utf-8",
+    )
+    (tmp_path / "first.html").write_text(
+        "<html><body><article><h1>Biological age</h1></article></body></html>",
+        encoding="utf-8",
+    )
+    (tmp_path / "second.html").write_text(
+        "<html><body><article><h1>Player profile</h1></article></body></html>",
+        encoding="utf-8",
+    )
+    pages = {
+        home: (tmp_path / "home.html").read_text(encoding="utf-8"),
+        blog: (tmp_path / "blog.html").read_text(encoding="utf-8"),
+        first: (tmp_path / "first.html").read_text(encoding="utf-8"),
+        second: (tmp_path / "second.html").read_text(encoding="utf-8"),
+    }
+    spec = replace(
+        parse_task("Take a screenshot of the website and the most recent content", target_url=home),
+        target_url=home,
+        artifact_types=["screenshot", "html_snapshot"],
+        screenshot_roles=["homepage", "latest_content"],
+        expect_rows=False,
+        required_columns=[],
+        step_budget=12,
+    )
+    browser = ScriptedBrowser(pages)
+    result = EvidenceAgent(browser, out_dir, planner=RulePlanner()).run(spec)
+    assert result.status == RunStatus.SUCCESS
+    assert result.metadata.get("recency_ambiguity") == "dates_unavailable"
+    assert result.metadata.get("latest_content_selection") == "document_order"
+    assert result.metadata.get("latest_content_url") == first
+    assert any("document order" in issue.message.lower() for issue in result.warnings)
+    assert not any(event.args.get("url") == second for event in result.trajectory if event.action == "navigate")
+    visits = [event.args.get("url") for event in result.trajectory if event.action == "open_most_recent"]
+    assert visits.count(first) == 1
+    shots = [item for item in result.artifacts if item.type == "screenshot"]
+    assert len(shots) == 2
+
+
 def test_repeated_observation_does_not_spin(agent: EvidenceAgent, out_dir: Path) -> None:
     from andera.paths import fixture_path
 
     target = fixture_path("portals", "access-review.html").resolve().as_uri()
     looping = EvidenceAgent(agent.browser, out_dir, planner=InspectLoopPlanner())
     result = looping.run("Collect the current user access list from the access review portal as CSV", target_url=target)
-    assert result.status == RunStatus.FAILED
-    assert any("loop" in issue.message.lower() or issue.code == "failed" for issue in result.errors)
     assert len(result.trajectory) < 20
     inspects = [event for event in result.trajectory if event.action == "inspect"]
     assert len(inspects) <= 5
+    assert result.status in {RunStatus.SUCCESS, RunStatus.FAILED}
+    if result.status == RunStatus.FAILED:
+        assert any("loop" in issue.message.lower() or issue.code == "failed" for issue in result.errors)
+    else:
+        assert any(event.action == "extract_table" for event in result.trajectory)
 
 
 def test_exhausted_step_budget_is_timeout(tmp_path: Path, out_dir: Path) -> None:

@@ -5,7 +5,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from andera.evidence import EvidenceStore, extract_table_schema
 from andera.html_query import node_visible_text, parse_html, query
@@ -100,8 +100,7 @@ def execute(
     columns: List[str] = []
     extract_step = 0
     screenshot_note = ""
-    digest_streak = 0
-    last_digest = ""
+    digest_history: List[str] = []
     changed_strategy = False
     env = _environment(browser)
     requested_types = {str(item).lower() for item in spec.artifact_types}
@@ -191,22 +190,25 @@ def execute(
                     status = worse_status(status, RunStatus.FAILED)
                     break
         screenshot_note = ""
-        if action.type in _PROGRESS_ACTIONS:
-            digest_streak = 0
-            changed_strategy = False
-        elif digest and digest == last_digest:
-            digest_streak += 1
-        else:
-            digest_streak = 1
-            changed_strategy = False
-        last_digest = digest
-        if digest_streak >= 3:
-            if not changed_strategy and action.type != "scroll":
-                changed_strategy = True
-                action = _change_stuck_strategy(spec, observation, html, trajectory)
-                record("checkpoint", {"reason": "stuck", "digest": digest}, "retry", html)
-            else:
-                record("report_failed", {"reason": "stuck", "digest": digest}, "failed", html)
+        loop_kind = _observation_loop(digest_history, digest)
+        if digest:
+            digest_history.append(digest)
+        if loop_kind and action.type not in _LOOP_ESCAPE_ACTIONS:
+            action, changed_strategy = _resolve_loop_action(
+                spec,
+                observation,
+                html,
+                trajectory,
+                changed_strategy,
+                loop_kind,
+            )
+            if action is None:
+                record(
+                    "report_failed",
+                    {"reason": "stuck", "loop": loop_kind, "digest": digest},
+                    "failed",
+                    html,
+                )
                 metadata["unmet_requirements"] = _merge_unmet(
                     metadata, _secondary_unmet(spec, trajectory, "stuck")
                 )
@@ -216,6 +218,15 @@ def execute(
                     store, artifacts, html, spec, len(trajectory), browser=browser, trajectory=trajectory
                 )
                 break
+            record(
+                "checkpoint",
+                {"reason": "stuck", "loop": loop_kind, "digest": digest, "next": action.type},
+                "retry",
+                html,
+            )
+            if action.type == "screenshot" and action.args.get("role") == "latest_content":
+                metadata.setdefault("recency_ambiguity", "dates_unavailable")
+                metadata.setdefault("latest_content_selection", "current_page")
         if not page_belongs_to_target(browser.current_url(), spec.target_url, trajectory):
             action = _require_target_navigation(action, spec)
         risk = classify_risk(action.type, " ".join(str(v) for v in action.args.values()))
@@ -562,6 +573,20 @@ def _apply_action(
                 extract_step,
                 screenshot_note,
             )
+        if resolved.reason:
+            metadata["recency_ambiguity"] = resolved.reason
+            metadata["latest_content_selection"] = "document_order"
+            metadata["recency_candidates"] = [
+                {"title": item.title, "url": item.url, "date": item.date}
+                for item in items
+            ]
+            warnings.append(
+                Issue(
+                    "recency_ambiguity",
+                    "Could not order content items by date; picked the first in document order",
+                    retryable=False,
+                )
+            )
         browser.goto(resolved.item.url)
         html = _safe_content(browser)
         record(
@@ -572,6 +597,8 @@ def _apply_action(
                 "date": resolved.item.date,
                 "title": resolved.item.title,
                 "undated": len(resolved.undated),
+                "reason": resolved.reason,
+                "selection": "document_order" if resolved.reason else "date",
             },
             "ok",
             html,
@@ -848,6 +875,8 @@ def _capture_screenshot(
                 trajectory_step=event.step,
             )
         )
+        if role == "latest_content" and current_url:
+            metadata.setdefault("latest_content_url", current_url)
         return status, "screenshot_captured"
     except NotImplementedError as exc:
         warnings.append(Issue("screenshot_unavailable", str(exc), retryable=False))
@@ -873,23 +902,6 @@ def _capture_screenshot(
             )
         )
         return status, "screenshot_unavailable"
-
-
-_PROGRESS_ACTIONS = {
-    "navigate",
-    "screenshot",
-    "extract_table",
-    "extract_list",
-    "extract_text",
-    "open_content_index",
-    "open_most_recent",
-    "download",
-    "done_subgoal",
-    "report_failed",
-    "report_blocked",
-    "type",
-    "select",
-}
 
 
 _SITE_STOP_TOKENS = (
@@ -923,6 +935,85 @@ def _failed_requirement(reason: str) -> List[str]:
     if "stuck" in blob:
         return ["stuck"]
     return []
+
+
+def _same_target_page(left: str, right: str) -> bool:
+    return (left or "").rstrip("/") == (right or "").rstrip("/")
+
+
+def _observation_loop(history: Sequence[str], digest: str) -> str:
+    """Return why this observation is a loop, ignoring which action produced it.
+
+    A stall is a revisited page identity: the same digest again, or a repeating
+    cycle of digests (A, B, A, B). Navigate is not forward motion if it lands
+    on a state already seen.
+    """
+    if not digest:
+        return ""
+    prior = [item for item in history if item]
+    seq = prior + [digest]
+    streak = 0
+    for item in reversed(seq):
+        if item != digest:
+            break
+        streak += 1
+    if streak >= 3:
+        return "repeat"
+    if digest in prior and prior[-1] != digest:
+        return "revisit"
+    length = len(seq)
+    for period in range(2, length // 2 + 1):
+        chunk = seq[-period:]
+        if chunk == seq[-2 * period : -period] and len(set(chunk)) >= 2:
+            return "cycle"
+    return ""
+
+
+_LOOP_ESCAPE_ACTIONS = {
+    "extract_table",
+    "extract_list",
+    "extract_text",
+    "screenshot",
+    "open_content_index",
+    "open_most_recent",
+    "download",
+    "done_subgoal",
+    "report_failed",
+    "report_blocked",
+}
+
+
+def _resolve_loop_action(
+    spec: TaskSpec,
+    observation: Dict[str, Any],
+    html: str,
+    trajectory: List[TrajectoryEvent],
+    changed_strategy: bool,
+    loop_kind: str,
+) -> Tuple[Optional[BrowserAction], bool]:
+    extracted = any(
+        event.action in {"extract_table", "extract_list"} and event.outcome == "ok" for event in trajectory
+    )
+    if loop_kind == "repeat" and "csv" in spec.artifact_types and spec.expect_rows and not extracted:
+        return (
+            BrowserAction("extract_table", {"selector": spec.required_selector or "table"}),
+            changed_strategy,
+        )
+    missing = _missing_screenshot_role(spec, trajectory)
+    on_home = _same_target_page(str(observation.get("url") or ""), spec.target_url)
+    if missing == "homepage" or (missing == "latest_content" and not on_home):
+        return (
+            BrowserAction(
+                "screenshot",
+                {"full_page": spec.screenshot_scope != "viewport", "role": missing},
+            ),
+            changed_strategy,
+        )
+    if not missing and spec.screenshot_roles:
+        return BrowserAction("done_subgoal", {}), changed_strategy
+    if not changed_strategy:
+        return _change_stuck_strategy(spec, observation, html, trajectory), True
+    return None, changed_strategy
 
 
 def _homepage_captured(trajectory: List[TrajectoryEvent]) -> bool:
@@ -959,14 +1050,13 @@ def _change_stuck_strategy(
     trajectory: List[TrajectoryEvent],
 ) -> BrowserAction:
     opened_index = any(event.action == "open_content_index" and event.outcome == "ok" for event in trajectory)
-    if (
-        "latest_content" in spec.screenshot_roles
-        and _homepage_captured(trajectory)
-        and not opened_index
-    ):
+    opened_recent = any(event.action == "open_most_recent" and event.outcome == "ok" for event in trajectory)
+    if "latest_content" in spec.screenshot_roles and _homepage_captured(trajectory):
         page_url = str(observation.get("url") or spec.target_url)
-        if observation.get("content_index_links") or discover_content_index(html, page_url):
+        if not opened_index and (observation.get("content_index_links") or discover_content_index(html, page_url)):
             return BrowserAction("open_content_index", {})
+        if opened_index and not opened_recent:
+            return BrowserAction("open_most_recent", {})
     return BrowserAction("scroll", {})
 
 

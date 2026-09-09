@@ -55,12 +55,27 @@ def test_undated_item_is_recorded_not_ranked_last() -> None:
     assert all(item.dated for item in items if item.url.endswith("/older"))
 
 
-def test_all_undated_does_not_pick_page_order() -> None:
+def test_unorderable_dates_pick_document_order() -> None:
     items = iter_content_items(ALL_UNDATED, "https://corp.example/blog")
     resolved = resolve_most_recent(items)
-    assert resolved.item is None
-    assert resolved.reason == "no_dated_content"
-    assert len(resolved.undated) >= 1
+    assert resolved.item is not None
+    assert resolved.item.url.endswith("/one")
+    assert resolved.reason == "dates_unavailable"
+    assert [item.url for item in resolved.undated if item.url.endswith("/two")]
+
+
+def test_tied_dates_pick_document_order() -> None:
+    html = """
+    <html><body>
+    <article><a href="https://corp.example/posts/first">First</a><time datetime="2026-06-15">Jun 15</time></article>
+    <article><a href="https://corp.example/posts/second">Second</a><time datetime="2026-06-15">Jun 15</time></article>
+    </body></html>
+    """
+    items = iter_content_items(html, "https://corp.example/blog")
+    resolved = resolve_most_recent(items)
+    assert resolved.item is not None
+    assert resolved.item.url.endswith("/first")
+    assert resolved.reason == "date_tie"
 
 
 def test_discovers_content_index_in_footer_and_aria_label() -> None:
