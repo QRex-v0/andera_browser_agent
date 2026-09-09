@@ -52,6 +52,20 @@ class FixtureBrowser:
     def current_url(self) -> str:
         return self._url
 
+    def observe(self) -> dict:
+        from andera.observe import observation_from_html
+
+        return observation_from_html(self._url, self._html)
+
+    def click(self, selector: str) -> None:
+        return None
+
+    def type_text(self, selector: str, text: str) -> None:
+        return None
+
+    def scroll(self) -> None:
+        return None
+
     def environment(self) -> dict:
         return {
             "name": "fixture",

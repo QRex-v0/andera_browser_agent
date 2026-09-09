@@ -45,17 +45,19 @@ playwright install chromium
 Fixture backend (default, no Chromium, deterministic):
 
 ```bash
-python -m andera run "Collect the current user access list from the access review portal as CSV"
+python -m andera run "Collect the current user access list from the access review portal as CSV" --planner rule --browser fixture
 ```
 
 Override the target or backend:
 
 ```bash
-python -m andera run "Collect the access list as CSV" --url fixtures/portals/access-review.html
-python -m andera run "Collect the access list as CSV and a screenshot" --browser playwright
+python -m andera run "Collect the access list as CSV" --url fixtures/portals/access-review.html --planner rule --browser fixture
+python -m andera run "Collect the access list as CSV and a screenshot" --planner rule --browser playwright
 ```
 
 Exit code `0` means `success`. Any other status prints JSON and exits `1`. Parse/setup errors exit `2`.
+
+Production default is `--planner openai --browser playwright`. It reads `OPENAI_API_KEY` and `OPENAI_MODEL` from the process environment or `environment/.env.local`. Pass `--url` for unseen pages; do not put credentials in the task text.
 
 ## Tests
 

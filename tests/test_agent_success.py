@@ -92,6 +92,8 @@ def test_cli_success(out_dir: Path) -> None:
             "Collect the current user access list from the access review portal as CSV",
             "--browser",
             "fixture",
+            "--planner",
+            "rule",
             "--out",
             str(out_dir),
         ]

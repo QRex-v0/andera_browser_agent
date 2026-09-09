@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 from andera.agent import EvidenceAgent, create_browser
-from andera.parse import parse_task
+from andera.env import openai_configured
+from andera.planner import create_planner
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,16 +19,22 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run", help="Execute one evidence-collection task")
     run.add_argument("task", help="Natural-language evidence task")
     run.add_argument("--url", help="Override target URL or local HTML path")
-    run.add_argument("--browser", choices=("fixture", "playwright"), default="fixture")
+    run.add_argument("--browser", choices=("fixture", "playwright"), default=None)
+    run.add_argument("--planner", choices=("openai", "rule"), default="openai")
     run.add_argument("--out", default="runs", help="Directory for artifacts and result.json")
     run.add_argument("--timeout-ms", type=int, default=None, help="Selector wait timeout")
     args = parser.parse_args(argv)
 
     try:
-        task = parse_task(args.task, target_url=args.url, timeout_ms=args.timeout_ms)
-        browser = create_browser(args.browser)
+        planner = create_planner(args.planner)
+        if args.planner == "openai" and not openai_configured():
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        browser_name = args.browser or ("playwright" if args.planner == "openai" else "fixture")
+        browser = create_browser(browser_name)
         try:
-            result = EvidenceAgent(browser, Path(args.out)).run(task)
+            result = EvidenceAgent(browser, Path(args.out), planner=planner).run(
+                args.task, target_url=args.url, timeout_ms=args.timeout_ms
+            )
         finally:
             browser.close()
     except Exception as exc:

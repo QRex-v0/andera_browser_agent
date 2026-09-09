@@ -11,7 +11,7 @@ from andera.browser.fixture import FixtureBrowser
 from andera.evidence import EvidenceStore, write_text
 from andera.executor import execute
 from andera.models import Artifact, EvidenceTask, RunResult, RunStatus, TaskSpec, utc_now
-from andera.parse import parse_task
+from andera.planner import Planner, RulePlanner
 from andera.provenance import build_provenance
 from andera.report import render_report
 from andera.verifier import verify
@@ -30,19 +30,24 @@ def create_browser(name: str) -> BrowserSession:
 class EvidenceAgent:
     """Run one evidence-collection task against a browser session."""
 
-    def __init__(self, browser: BrowserSession, out_dir: Path) -> None:
+    def __init__(self, browser: BrowserSession, out_dir: Path, planner: Planner | None = None) -> None:
         self.browser = browser
         self.out_dir = out_dir
+        self.planner = planner or RulePlanner()
 
-    def run(self, task: Union[EvidenceTask, str]) -> RunResult:
-        parsed: TaskSpec = task if isinstance(task, TaskSpec) else parse_task(task)
+    def run(self, task: Union[EvidenceTask, str], target_url: str | None = None, timeout_ms: int | None = None) -> RunResult:
+        parsed: TaskSpec = (
+            task
+            if isinstance(task, TaskSpec)
+            else self.planner.plan(task, target_url=target_url, timeout_ms=timeout_ms)
+        )
         started = time.monotonic()
         started_at = utc_now()
         run_dir = self._run_dir()
         store = EvidenceStore(run_dir)
         store.write_json_file("task.json", parsed)
 
-        outcome = execute(self.browser, parsed, store, started, started_at)
+        outcome = execute(self.browser, parsed, store, started, started_at, planner=self.planner)
         provenance = build_provenance(parsed, outcome)
         provenance_path = store.write_json_file("provenance.json", provenance)
         verified = verify(parsed, outcome, provenance)
