@@ -1,101 +1,187 @@
-# Andera Browser Agent — Implementation Plan
+# Andera Evidence Agent — Implementation Plan
 
 [CODEX-GPT-5]
 
-## Objective
+This document is the source of truth for product architecture, delivery phases, and Cursor/Codex ownership.
 
-Build a general browser agent for audit evidence collection. A user provides a natural-language task, and the agent navigates a target system in read-only mode, collects requested evidence, verifies that the evidence is complete, and produces auditable artifacts such as screenshots, CSV files, downloads, HTML snapshots, and structured metadata.
+## 1. Product definition
 
-The optimization order is:
+Andera is an evidence-production system whose executor is a browser agent. A wrong answer is worse than no answer.
+
+Priority order:
 
 1. Accuracy
-2. Generality across tasks and systems
-3. Consistency and reproducibility
-4. Scalability
+2. Generality
+3. Scalability
+4. Consistency
 5. Speed
 
-## Target architecture
+The system accepts a natural-language task and produces verified evidence: screenshots, CSVs, downloads, HTML snapshots, prose, and provenance metadata.
+
+## 2. Core guarantees
+
+- The executor cannot approve its own result.
+- Requested evidence must exist and pass verification before a run succeeds.
+- Every output field can be traced to evidence, URL, timestamp, and trajectory step.
+- Missing or unverifiable evidence produces `partial`, `blocked`, `timeout`, or `failed`, never false success.
+- Browser execution is read-only by default and bounded by time and step budgets.
+- Credentials never enter model context, prompts, or action logs.
+- Model reasoning is not stored; only actions, observations, evidence, and decisions are logged.
+
+Canonical statuses:
 
 ```text
-User task
-   ↓
-Task planner → structured TaskSpec
-   ↓
-Bounded agent loop: Observe → Decide → Act → Verify
-   ↓
-Browser runtime: navigate, click, fill, select, wait, extract, download
-   ↓
-Evidence collector: screenshots, HTML, CSV, files, trace
-   ↓
-Verifier: success / incomplete / timeout / failed
-   ↓
-result.json + evidence artifacts
+success
+partial
+blocked
+timeout
+failed
 ```
 
-### Design principles
+## 3. Architecture
 
-- Keep Python and Playwright as the initial implementation stack.
-- Define a `Planner` interface with a deterministic implementation for tests and an LLM-backed implementation for general tasks.
-- Keep task planning, browser execution, evidence capture, and result verification as separate components.
-- Do not depend on hardcoded portal names or a single CSS selector in production execution.
-- Give every run a bounded step count and timeout.
-- Never report success when requested evidence is absent, empty, stale, or unverifiable.
-- Record source URL, capture time, MIME type, byte size, hash, and originating action for each artifact.
-- Keep authentication local-first through Playwright storage state or an attached browser session. Do not ask users to place passwords in task prompts.
+```text
+Natural-language task
+        ↓
+Planner → TaskSpec
+        ↓
+Executor: Observe → Decide → Act
+        ↓
+Evidence store + trajectory
+        ↓
+Independent verifier
+        ↓
+RunResult + artifacts + review report
+```
 
-## MVP — three-hour build
+### 3.1 Planner
 
-### Goal
+The planner produces a typed `TaskSpec` containing:
 
-Complete representative evidence-collection test cases through a real browser and produce trustworthy, reviewable outputs.
+- Ordered subgoals
+- Target systems and URLs
+- Requested output artifacts
+- Evidence requirements
+- Required fields or columns when explicitly specified
+- Completion criteria
+- Step and time budgets
+- `write_actions_allowed`, defaulting to `false`
 
-### 0:00–0:20 — Establish the baseline
+The planner fixes explicitly requested schemas before execution. If the user did not specify a schema, the executor may infer one from observed data and freeze it before output generation.
 
-- Cursor commits its current vertical slice and opens a draft PR.
-- Collect and classify the provided test cases by required browser actions and outputs.
-- Install development dependencies and run the current test suite.
-- Record the starting pass rate, failures, latency, and environmental assumptions.
-- Freeze the MVP acceptance criteria before broadening the implementation.
+The executor may report `spec_mismatch`. This permits one bounded replan. A second mismatch terminates without success.
 
-Deliverable: a known baseline, a prioritized eval matrix, and a passing deterministic fixture suite.
+### 3.2 Executor
 
-### 0:20–1:05 — General browser execution
+The executor uses typed browser actions:
 
-Implement a real Playwright path with these browser primitives:
+```text
+navigate
+inspect
+click
+type
+select
+scroll
+wait
+back
+extract_table
+extract_text
+screenshot
+download
+checkpoint
+report_blocked
+done_subgoal
+```
 
-- Navigate and wait for page readiness
-- Inspect DOM and accessibility information
-- Click links and buttons
-- Fill text fields
-- Select options
-- Scroll
-- Wait for elements or page state
-- Extract text and tables
-- Capture downloads
-- Capture screenshots
+Perception is adaptive:
 
-Add a bounded execution loop that records every observation and action. The production path should select actions from page state rather than from one hardcoded fixture or selector.
+1. Start with DOM and accessibility information.
+2. Add a screenshot when layout, canvas, visual state, or ambiguity requires vision.
+3. Use semantic locators based on role, accessible name, labels, and nearby text.
+4. Treat raw CSS/XPath as a cached hint, not the source of truth.
 
-### 1:05–1:50 — Evidence capture and verification
+Stuck detection hashes the URL and observation digest. Repeated states trigger one alternate strategy, then a blocked result.
 
-Implement:
+Search-engine fallback may help discover a target page but cannot replace evidence from the requested source unless the task explicitly permits secondary sources.
 
-- Generic table-to-CSV extraction
-- Full-page and targeted screenshots
-- HTML snapshots
-- Download capture
-- Structured action trace in `trace.jsonl`
-- Artifact hashing and provenance metadata
-- Explicit verification of every requested output
-- Consistent `success`, `incomplete`, `timeout`, and `failed` outcomes
+### 3.3 Action safety
 
-Expected run structure:
+`click` and `type` can mutate data even without an explicit submit action. Every action receives a risk classification.
+
+Blocked by default:
+
+- Submit, approve, merge, purchase, send, publish, delete, or modify
+- Typing into autosaving editors
+- Pressing Enter where it can submit
+- Uploading files
+- Changing account or system settings
+
+Potentially mutating actions require explicit task authorization and a human checkpoint. External writes use a separate output adapter rather than the evidence-collection executor.
+
+### 3.4 Browser provider
+
+Initial provider: local Playwright Chromium with pinned browser version, locale, timezone, and viewport.
+
+Interface:
+
+```text
+new_session
+goto
+observe
+click
+type
+select
+scroll
+wait
+screenshot
+expect_download
+current_url
+close
+```
+
+Persistent Playwright storage state supports authenticated sessions after a human logs in. Hosted browsers are deferred until local behavior is reliable.
+
+### 3.5 Evidence store
+
+The MVP uses an append-only filesystem store. Artifacts are addressed by SHA-256 and described by a manifest.
+
+Each artifact records:
+
+- Task ID and run ID
+- Evidence ID and SHA-256
+- MIME type and byte size
+- Source URL
+- Capture timestamp
+- Trajectory step
+- Browser environment version
+- Viewport
+- Extraction locator or source region
+
+Field-level provenance is stored separately from exported CSVs:
+
+```json
+{
+  "value": "Org Owner",
+  "evidence_refs": ["sha256:..."],
+  "source_url": "https://example.test/access-review",
+  "captured_at": "2026-09-09T18:00:00Z",
+  "trajectory_step": 8,
+  "source_locator": {
+    "row": 2,
+    "column": "Role"
+  }
+}
+```
+
+Expected run directory:
 
 ```text
 runs/<run-id>/
   task.json
   trace.jsonl
   result.json
+  provenance.json
+  report.html
   evidence/
     screenshot-final.png
     page-final.html
@@ -103,149 +189,190 @@ runs/<run-id>/
   downloads/
 ```
 
-### 1:50–2:35 — Evaluation loop
+### 3.6 Verifier
 
-- Run every visible test case.
-- Rank failures by likely impact on hidden evaluations.
-- Fix navigation, dynamic loading, element targeting, tables, downloads, and completion detection.
-- Add a regression test for every corrected failure.
-- Run important cases repeatedly to detect flaky behavior.
+The verifier runs independently and receives only:
 
-### 2:35–3:00 — Release checkpoint
+- Original task
+- `TaskSpec`
+- Produced outputs
+- Referenced evidence
+- Action trajectory without private model reasoning
 
-- Run the complete deterministic and Playwright test suites.
-- Review all changed files and generated outputs.
+Code checks first:
+
+- Required artifacts exist and are nonempty
+- Output schema is valid
+- Required row counts and columns are satisfied
+- Ordering, dates, and identifiers meet the task contract
+- Every source URL was visited
+- Every output field has valid provenance
+- Downloaded files have expected types and sizes
+
+For machine-checkable values, use an independent extraction or cross-check where practical. An optional fresh-context semantic verifier handles prose or ambiguous claims and may downgrade a result, never upgrade it.
+
+`partial`, `blocked`, and `failed` results list unmet requirements. Verifier failure reuses persisted evidence rather than rerunning the browser.
+
+### 3.7 Audit report and human review
+
+The MVP generates a static `report.html` for each run showing:
+
+- Task and final status
+- Requested and delivered evidence
+- Verifier checks
+- Action timeline
+- Screenshots and downloads
+- Output-to-evidence links
+
+Reviewer decisions never overwrite machine results. Store append-only review annotations:
+
+```text
+machine_status
+reviewer_status
+reviewer_id
+reviewed_at
+override_reason
+supporting_evidence_refs
+```
+
+Phase 1 adds batch triage. Phase 2 adds the complete interactive review application.
+
+## 4. MVP — three hours
+
+### Goal
+
+Complete the highest-value visible test cases through real Playwright and produce trustworthy, reviewable evidence.
+
+### 0:00–0:20 — Baseline
+
+- Cursor commits and opens its current vertical-slice PR.
+- Install development dependencies and run existing tests.
+- Add supplied test cases to an eval matrix.
+- Record baseline pass rate, latency, and failure reasons.
+- Freeze MVP acceptance criteria.
+
+### 0:20–0:50 — Contracts
+
+- Define `TaskSpec`, `BrowserAction`, `TrajectoryEvent`, `Artifact`, and `RunResult`.
+- Adopt the canonical status vocabulary.
+- Define action-risk policy and evidence requirements.
+- Preserve compatibility with the working fixture tests.
+
+### 0:50–1:40 — Browser loop
+
+- Implement real Playwright execution.
+- Add only the browser actions required by visible tests.
+- Add semantic observation and targeting.
+- Enforce step/time budgets and stuck detection.
+- Record trajectory events.
+
+### 1:40–2:10 — Evidence and verification
+
+- Capture requested screenshots, HTML, CSVs, and downloads.
+- Add SHA-256 manifests and field-level provenance.
+- Implement deterministic verifier checks.
+- Generate a static per-run review report.
+
+### 2:10–2:45 — Eval loop
+
+- Run all visible tests.
+- Fix failures in likely hidden-eval impact order.
+- Add a regression test for each corrected failure.
+- Repeat important tests to detect flakiness.
+
+### 2:45–3:00 — Release checkpoint
+
+- Run the complete test suite.
+- Review diffs and generated evidence.
+- Publish pass/partial/fail results and known limitations.
 - Merge only passing PRs.
-- Update the README with setup, execution, and demonstration commands.
-- Publish an eval summary containing pass, partial, fail, latency, and known limitations.
 
 ### MVP acceptance criteria
 
-- At least one real Playwright workflow completes end to end.
-- A natural-language task is converted into a structured execution goal.
-- Production execution is not tied to one fixture name or one fixed selector.
-- CSV, screenshot, HTML, and downloaded-file evidence are supported.
-- Every artifact includes timestamps, source URL, hash, and traceability metadata.
-- Missing requested evidence cannot be reported as success.
-- Success, incomplete evidence, timeout, and navigation failure are tested.
-- Visible evaluation results are reproducible across repeated runs.
+- At least one real Playwright workflow succeeds end to end.
+- Natural language becomes a structured `TaskSpec`.
+- Production execution is not tied to one portal or fixed selector.
+- Required evidence types for visible tests are supported.
+- Every output is traceable to evidence.
+- Missing evidence cannot produce success.
+- Success, partial, blocked, timeout, and failure paths are tested.
+- Important cases are reproducible across repeated runs.
 
-### MVP non-goals
+### Explicit MVP cuts
 
-- Hosted web UI
-- Multi-tenant account management
-- Full enterprise SSO implementation
-- Distributed browser workers
-- Thousands-of-jobs concurrency
-- Numerous system-specific ERP adapters
+- No hosted browser backend
+- No skill compilation or replay
+- No distributed batch execution
+- No complete review web application
+- No Google Sheets or other external write adapter unless required by a visible test
+- No vision call on every browser step
+- No mandatory semantic-verifier call for machine-checkable tasks
 
-## Phase 1 — Reliability and coverage
+## 5. Phase 1 — reliability and coverage
 
-Target: the next one to three development days after the MVP.
+Target: the next one to three development days.
 
-### Browser capability
-
-- Persistent authenticated browser profiles
-- Tabs, popups, iframes, and multi-page workflows
-- Pagination and infinite scrolling
+- Tabs, popups, iframes, pagination, and infinite scrolling
 - Filters, date pickers, autocomplete, and dynamic tables
-- Robust semantic element targeting
-- Stale-element and navigation recovery
-- Download detection and filename normalization
+- Persistent authenticated profiles
+- Error-specific retries and checkpoint/resume
+- Multiple evidence requirements per task
+- Independent numeric/date/ordering cross-checks
+- Batch eval runner with pass@1, pass@k, consistency, latency, and cost
+- Batch triage grouped by status and failure reason
+- Append-only reviewer annotations and overrides
+- Risk-based and stratified random review sampling
+- Fixture library covering multiple portal layouts
+- Skill replay prototype with strict preconditions and postconditions
 
-### Agent reliability
+Skill replay aborts on domain mismatch, ambiguous locator, changed schema, failed postcondition, or materially different page fingerprint.
 
-- Error-specific retry policies
-- Checkpoint and resume within a run
-- Stronger task decomposition and completion detection
-- Human approval for ambiguous or potentially mutating actions
-- Multiple evidence requirements in one task
-- Protection against task completion based only on model assertion
-
-### Evidence quality
-
-- Region-specific screenshots tied to extracted records
-- Artifact deduplication and integrity hashes
-- Evidence freshness checks
-- Redaction rules for secrets and sensitive fields
-- Stable artifact naming and schema versioning
-- Natural-language summaries grounded in collected artifacts
-
-### Evaluation
-
-- Batch eval runner
-- Pass rate, evidence completeness, latency, cost, and flake-rate metrics
-- Fixture library resembling GitHub, Jira/Linear, Workday, NetSuite, and similar systems
-- Regression tests generated from every discovered failure
-- Model and prompt comparisons using the same test corpus
-
-### Phase 1 exit criteria
+Phase 1 exit criteria:
 
 - Strong visible-eval coverage
 - Reproducible outcomes over repeated runs
-- Successful execution across several different portal layouts
+- Multiple distinct portal layouts supported
 - No known false-success cases
-- Clear failure diagnostics and replayable traces
+- Useful failure diagnostics and replayable traces
 
-## Phase 2 — Production and scale
-
-Target: after agent behavior is proven through Phase 1 evaluations.
-
-### Platform
+## 6. Phase 2 — production and scale
 
 - Isolated browser workers and job queues
-- Horizontal batch execution for thousands of samples
-- Per-tenant isolation
-- Encrypted credential and browser-session storage
-- API service and web interface
-- SSO, user roles, retention controls, and audit logs
-
-### Operations
-
-- Distributed tracing and structured metrics
-- Run replay and debugging interface
-- Browser crash recovery and resumable jobs
+- Thousands-of-samples batch execution
+- Hosted browser provider when justified by auth or scale
+- Tenant isolation and encrypted session storage
+- API service and interactive review UI
+- SSO, roles, retention controls, and audit logs
+- Statistical review sampling and override analytics
+- Run replay, crash recovery, and resumable jobs
 - Per-domain reliability dashboards
-- Cost and latency routing between planning models
-- Versioned prompts, policies, and evidence schemas
+- Versioned models, prompts, policies, skills, and schemas
+- Cost and latency routing between models
+- Domain adapters only when generic browser behavior is insufficient
 
-### Governance and safety
-
-- Enforced read-only policy where possible
-- Domain and action allowlists
-- Approval gates for potentially mutating actions
-- Sensitive-data redaction and configurable retention
-- Complete operator and agent audit trail
-
-### Extensibility
-
-- Domain adapters only where generic browser behavior is insufficient
-- Connector interface for APIs and direct exports
-- Custom extraction and verification policies
-- Continuous hidden-eval-style test generation
-
-## Evaluation scorecard
-
-Every test case should record:
+## 7. Evaluation scorecard
 
 | Metric | Meaning |
 |---|---|
-| Task success | The requested workflow completed |
-| Evidence correctness | The collected data matches the source |
+| Task success | Requested workflow completed |
+| Evidence correctness | Collected data matches the source |
 | Evidence completeness | Every requested artifact is present and nonempty |
-| Provenance quality | Artifacts can be traced to URL, time, and action |
-| Consistency | Repeated runs produce equivalent results |
+| Provenance quality | Outputs trace to URL, time, and browser step |
+| Consistency | Equivalent runs produce equivalent results |
 | Latency | End-to-end completion time |
-| Cost | Model and browser resource usage |
-| Failure quality | Errors are explicit, accurate, and actionable |
+| Cost | Model and browser resource use |
+| Failure quality | Errors are explicit and actionable |
 
-## Cursor and Codex ownership
+For changing websites, measure process and schema consistency within a recorded freeze window rather than requiring exact content equality indefinitely.
+
+## 8. Ownership and GitHub workflow
 
 ### Cursor
 
 - Primary browser and product implementation
 - Playwright actions and page interaction
 - Implementation tests for each assigned slice
+- Branches named `cursor/<short-task-name>`
 - Focused implementation PRs
 
 ### Codex
@@ -254,24 +381,23 @@ Every test case should record:
 - Eval harness and acceptance criteria
 - Code and PR review
 - Integration tests and reliability analysis
+- Branches named `codex/<short-task-name>`
 - GitHub coordination and release verification
 
-## Collaboration workflow
+### Workflow
 
-- Cursor uses branches named `cursor/<short-task-name>`.
-- Codex uses branches named `codex/<short-task-name>`.
 - `main` receives changes only through reviewed, passing PRs.
 - Cursor checkpoints every 30–40 minutes with a commit or draft PR.
 - Codex reviews each checkpoint and returns signed, line-specific feedback.
-- The two agents do not edit the same files concurrently.
+- Cursor and Codex do not edit the same files concurrently.
 - Every Codex GitHub comment begins with `[CODEX-GPT-5]`.
-- Every handoff includes changed files, commands run, test results, and known limitations.
+- Every handoff includes changed files, commands, test results, and known limitations.
 
-## Immediate execution order
+## 9. Immediate execution order
 
-1. Cursor commits and opens the current vertical-slice PR.
-2. Codex reviews the implementation and establishes the baseline eval score.
-3. The team adds the supplied test cases to the eval matrix.
+1. Cursor opens the current vertical-slice PR.
+2. Codex reviews it and establishes the baseline eval score.
+3. Add supplied test cases to the eval matrix.
 4. Cursor implements the generic Playwright action loop.
-5. Codex implements or reviews evidence verification and regression coverage.
-6. Both agents iterate on visible test failures until the release checkpoint.
+5. Codex implements or reviews verification and regression coverage.
+6. Iterate on visible failures until the release checkpoint.
