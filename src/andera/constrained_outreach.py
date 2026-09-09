@@ -39,9 +39,9 @@ class GeneratedEmail:
 class OutreachOptions:
     sender_name: str = "Andera"
     sender_company: str = "Andera"
-    call_to_action: str = "Would a brief conversation next week be useful?"
-    value_proposition: str = "I would like to share a brief idea if it is relevant."
-    max_description_chars: int = 180
+    call_to_action: str = "Would you be open to a 15-minute call next week?"
+    value_proposition: str = "I have a short idea that may be relevant."
+    max_description_chars: int = 150
 
 
 _FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -80,13 +80,13 @@ def generate_founder_outreach_email(
     batch = selected.get("yc_batch")
 
     used.extend([founder, company])
-    subject = f"Quick note for {company.value}"
+    subject = f"15 minutes about {company.value}?"
     first_name = _first_name(founder.value)
     lines = [f"Hi {first_name}," if first_name else "Hi,"]
 
     if description:
-        description_text = _trim_sentence(description.value, opts.max_description_chars)
-        text = f"I saw that {company.value} describes itself as {description_text}."
+        focus = _description_focus(company.value, description.value, opts.max_description_chars)
+        text = f"{company.value} caught my eye because it is {focus}."
         lines.append("")
         lines.append(text)
         used.extend([description])
@@ -103,16 +103,15 @@ def generate_founder_outreach_email(
         used.extend(role_batch_used)
         claims.append(EmailClaim(text=role_batch_text, fact_ids=role_batch_fact_ids))
 
-    lines.extend(
-        [
-            "",
-            opts.value_proposition,
-            opts.call_to_action,
-            "",
-            f"Best,",
-            opts.sender_name,
-        ]
+    value_text, value_fact_ids, value_used = _value_proposition_sentence(
+        opts=opts,
+        company=company,
+        description=description,
     )
+    lines.extend(["", value_text, opts.call_to_action, "", "Best,", opts.sender_name])
+    if value_fact_ids:
+        claims.append(EmailClaim(text=value_text, fact_ids=value_fact_ids))
+        used.extend(value_used)
     used = _dedupe_facts(used)
     return GeneratedEmail(
         subject=subject,
@@ -257,18 +256,77 @@ def _role_batch_sentence(
     batch: Optional[CollectedFact],
 ) -> Tuple[str, List[str], List[CollectedFact]]:
     if role and batch:
-        text = (
-            f"I also saw {founder.value} listed as {role.value} at {company.value}, "
-            f"with {company.value} in {batch.value}."
-        )
+        text = f"I also saw you listed as {role.value}, with {company.value} in {batch.value}."
         return text, [founder.fact_id, role.fact_id, company.fact_id, batch.fact_id], [role, batch]
     if role:
-        text = f"I also saw {founder.value} listed as {role.value} at {company.value}."
+        text = f"I also saw you listed as {role.value} at {company.value}."
         return text, [founder.fact_id, role.fact_id, company.fact_id], [role]
     if batch:
         text = f"I also saw {company.value} listed in {batch.value}."
         return text, [company.fact_id, batch.fact_id], [batch]
     return "", [], []
+
+
+def _value_proposition_sentence(
+    *,
+    opts: OutreachOptions,
+    company: CollectedFact,
+    description: Optional[CollectedFact],
+) -> Tuple[str, List[str], List[CollectedFact]]:
+    if not description:
+        return opts.value_proposition, [], []
+    topic = _idea_topic(description.value)
+    if not topic:
+        return opts.value_proposition, [], []
+    text = f"I have a short idea around {topic} that may be useful for {company.value}."
+    return text, [company.fact_id, description.fact_id], [description]
+
+
+def _description_focus(company: str, description: str, limit: int) -> str:
+    text = _first_sentence(description)
+    text = _remove_leading_company(text, company)
+    text = re.sub(
+        r"^(?:a|an)\s+Y\s+Combinator\s+[A-Z]\d{2}\s+company\s+",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"^(?:a|an)\s+YC\s+[A-Z]\d{2}\s+company\s+", "", text, flags=re.I)
+    text = _clean(text).strip(" .")
+    if not text:
+        text = _clean(description).strip(" .")
+    if not re.match(r"^(?:building|creating|developing|making|helping|working|focused|a|an|the)\b", text, re.I):
+        text = f"focused on {text}"
+    return _trim_sentence(text, limit).rstrip(".")
+
+
+def _idea_topic(description: str) -> str:
+    text = _clean(description).lower()
+    if "voice recorder" in text:
+        return "the AI voice recorder device experience"
+    if "hardware" in text and "software" in text:
+        return "the hardware-plus-software product experience"
+    if "developer" in text:
+        return "the developer experience"
+    focus = _description_focus("", description, 80)
+    if focus.lower().startswith(("building ", "creating ", "developing ", "making ")):
+        focus = re.sub(r"^[A-Za-z]+\s+", "", focus, count=1)
+    return focus.rstrip(".")
+
+
+def _first_sentence(text: str) -> str:
+    cleaned = _clean(text)
+    match = re.search(r"(?<=[.!?])\s+", cleaned)
+    return cleaned[: match.start()].strip() if match else cleaned
+
+
+def _remove_leading_company(text: str, company: str) -> str:
+    company_clean = re.escape(_clean(company))
+    if not company_clean:
+        return text
+    text = re.sub(rf"^{company_clean}\s+(?:is|are|was|were)\s+", "", text, flags=re.I)
+    text = re.sub(rf"^{company_clean}\s+", "", text, flags=re.I)
+    return text
 
 
 def _provenance_by_column(

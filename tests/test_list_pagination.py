@@ -45,8 +45,10 @@ class OneArgLoadMoreBrowser:
             _items_html(
                 [
                     ("Gamma founder update", "/gamma?utm_source=feed"),
+                    ("Gamma founder update", "/gamma?utm_campaign=repeat"),
                     ("Delta founder update", "/delta"),
                     ("Epsilon founder update", "/epsilon"),
+                    ("Zeta founder update", "/zeta"),
                 ]
             ),
         ]
@@ -122,7 +124,7 @@ def test_load_more_supports_one_argument_click_and_dedupes() -> None:
 
     result = collect_incremental_records(
         browser,
-        target_count=4,
+        target_count=5,
         page_url=browser.current_url(),
         initial_html=browser.content(),
         max_rounds=3,
@@ -131,11 +133,15 @@ def test_load_more_supports_one_argument_click_and_dedupes() -> None:
 
     assert result.termination_reason == "target_count_reached"
     assert result.pagination_shape == "load_more"
-    assert result.collected_count == 4
-    assert result.duplicate_count == 1
+    assert result.collected_count == 5
+    assert result.duplicate_count == 2
+    assert result.cross_snapshot_duplicate_count == 1
+    assert result.within_snapshot_duplicate_count == 1
     assert browser.clicks == ['button[id="load-more"]']
-    assert result.steps[0].new_count == 2
-    assert result.steps[0].duplicate_count == 1
+    assert result.steps[0].new_count == 3
+    assert result.steps[0].duplicate_count == 2
+    assert result.steps[0].cross_snapshot_duplicate_count == 1
+    assert result.steps[0].within_snapshot_duplicate_count == 1
 
 
 def test_action_failure_is_not_reported_as_exhaustion() -> None:

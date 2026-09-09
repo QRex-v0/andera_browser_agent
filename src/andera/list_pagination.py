@@ -28,6 +28,8 @@ class PaginationStep:
     after_count: int
     new_count: int
     duplicate_count: int = 0
+    cross_snapshot_duplicate_count: int = 0
+    within_snapshot_duplicate_count: int = 0
     url: str = ""
     selector: str = ""
     label: str = ""
@@ -45,6 +47,8 @@ class IncrementalListResult:
     termination_reason: str
     pagination_shape: str
     duplicate_count: int = 0
+    cross_snapshot_duplicate_count: int = 0
+    within_snapshot_duplicate_count: int = 0
     rounds: int = 0
     elapsed_ms: int = 0
     visited_urls: List[str] = field(default_factory=list)
@@ -65,6 +69,17 @@ class _Action:
 class _ActionOutcome:
     ok: bool
     detail: str = ""
+
+
+@dataclass
+class _MergeResult:
+    added: int = 0
+    cross_snapshot_duplicates: int = 0
+    within_snapshot_duplicates: int = 0
+
+    @property
+    def duplicate_count(self) -> int:
+        return self.cross_snapshot_duplicates + self.within_snapshot_duplicates
 
 
 def collect_incremental_records(
@@ -95,6 +110,8 @@ def collect_incremental_records(
     steps: List[PaginationStep] = []
     shapes: List[str] = []
     duplicate_total = 0
+    cross_snapshot_duplicate_total = 0
+    within_snapshot_duplicate_total = 0
     no_progress = 0
     last_html = initial_html or ""
     last_url = page_url
@@ -115,6 +132,8 @@ def collect_incremental_records(
             termination_reason=reason,
             pagination_shape=shape,
             duplicate_count=duplicate_total,
+            cross_snapshot_duplicate_count=cross_snapshot_duplicate_total,
+            within_snapshot_duplicate_count=within_snapshot_duplicate_total,
             rounds=rounds,
             elapsed_ms=int((time.monotonic() - started) * 1000),
             visited_urls=visited_urls,
@@ -129,7 +148,7 @@ def collect_incremental_records(
         last_url = url
         if url and url not in visited_urls:
             visited_urls.append(url)
-        added, duplicates = _merge_snapshot(
+        merge = _merge_snapshot(
             html,
             url,
             container_selector,
@@ -137,7 +156,9 @@ def collect_incremental_records(
             seen_snapshot_keys,
             accept_record,
         )
-        duplicate_total += duplicates
+        duplicate_total += merge.duplicate_count
+        cross_snapshot_duplicate_total += merge.cross_snapshot_duplicates
+        within_snapshot_duplicate_total += merge.within_snapshot_duplicates
         if requested > 0 and len(records_by_key) >= requested:
             return finish("target_count_reached", exhausted=False, rounds=rounds)
         if time.monotonic() >= deadline:
@@ -165,6 +186,8 @@ def collect_incremental_records(
                     after_count=before,
                     new_count=0,
                     duplicate_count=0,
+                    cross_snapshot_duplicate_count=0,
+                    within_snapshot_duplicate_count=0,
                     url=action.href or url,
                     selector=action.selector,
                     label=action.label,
@@ -178,7 +201,7 @@ def collect_incremental_records(
         after_url = _current_url(browser) or action.href or url
         last_html = after_html
         last_url = after_url
-        added, duplicates = _merge_snapshot(
+        merge = _merge_snapshot(
             after_html,
             after_url,
             container_selector,
@@ -186,7 +209,9 @@ def collect_incremental_records(
             seen_snapshot_keys,
             accept_record,
         )
-        duplicate_total += duplicates
+        duplicate_total += merge.duplicate_count
+        cross_snapshot_duplicate_total += merge.cross_snapshot_duplicates
+        within_snapshot_duplicate_total += merge.within_snapshot_duplicates
         rounds += 1
         shapes.append(action.shape)
         if after_url and after_url not in visited_urls:
@@ -198,15 +223,17 @@ def collect_incremental_records(
                 action=action.kind,
                 before_count=before,
                 after_count=len(records_by_key),
-                new_count=added,
-                duplicate_count=duplicates,
+                new_count=merge.added,
+                duplicate_count=merge.duplicate_count,
+                cross_snapshot_duplicate_count=merge.cross_snapshot_duplicates,
+                within_snapshot_duplicate_count=merge.within_snapshot_duplicates,
                 url=action.href or after_url,
                 selector=action.selector,
                 label=action.label,
                 evidence=action.evidence,
             )
         )
-        if added:
+        if merge.added:
             no_progress = 0
             continue
         no_progress += 1
@@ -236,7 +263,7 @@ def _merge_snapshot(
     records_by_key: Dict[str, RawRecord],
     seen_snapshot_keys: set[Tuple[str, Tuple[str, ...]]],
     accept_record: Optional[Callable[[RawRecord], bool]],
-) -> Tuple[int, int]:
+) -> _MergeResult:
     records = iter_raw_records(html, page_url, container_selector=container_selector)
     accepted: List[Tuple[str, RawRecord]] = []
     for record in records:
@@ -245,17 +272,28 @@ def _merge_snapshot(
         accepted.append((stable_record_key(record), record))
     snapshot_key = (_canonical_url(page_url), tuple(key for key, _record in accepted))
     if snapshot_key in seen_snapshot_keys:
-        return 0, 0
+        return _MergeResult()
     seen_snapshot_keys.add(snapshot_key)
     added = 0
-    duplicates = 0
+    cross_snapshot_duplicates = 0
+    within_snapshot_duplicates = 0
+    existing_keys = set(records_by_key)
+    snapshot_seen: set[str] = set()
     for key, record in accepted:
-        if key in records_by_key:
-            duplicates += 1
+        if key in snapshot_seen:
+            within_snapshot_duplicates += 1
+            continue
+        snapshot_seen.add(key)
+        if key in existing_keys:
+            cross_snapshot_duplicates += 1
             continue
         records_by_key[key] = record
         added += 1
-    return added, duplicates
+    return _MergeResult(
+        added=added,
+        cross_snapshot_duplicates=cross_snapshot_duplicates,
+        within_snapshot_duplicates=within_snapshot_duplicates,
+    )
 
 
 def _choose_action(
