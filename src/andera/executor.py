@@ -6,12 +6,14 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from andera.evidence import EvidenceStore, extract_table_schema, extract_visible_text, sha256_hex
 from andera.html_query import node_visible_text, parse_html, query
 from andera.content_index import _absolutize, discover_content_index, iter_content_items, resolve_most_recent
 from andera.list_extract import (
     apply_semantic_sort,
+    collect_incremental_schema_rows,
     detail_values,
     extract_schema_rows,
     is_detail_field,
@@ -335,6 +337,7 @@ def execute(
             status,
             remaining_ms=remaining_ms(),
             trajectory=trajectory,
+            metadata=metadata,
         )
 
     if html and not any(item.type == "html_snapshot" for item in artifacts):
@@ -441,18 +444,33 @@ def _apply_action(
             focus.pop("inspect", None)
         requested = str(args.get("url") or spec.target_url)
         browser.goto(requested)
-        html = _safe_content(browser)
+        html = _await_rendered_page(browser, spec, remaining_ms, selector)
+        final_url = ""
+        try:
+            final_url = browser.current_url() or requested
+        except Exception:
+            final_url = requested
         record(
             "navigate",
-            {"url": requested, "final_url": browser.current_url() or requested},
+            {"url": requested, "final_url": final_url},
             "ok",
             html,
             risk,
         )
+        if _is_site_stop_page(html, spec.required_selector, final_url):
+            reason = (
+                "authentication_required"
+                if _is_auth_wall(html, spec.required_selector, final_url)
+                else "site_policy"
+            )
+            record("report_blocked", {"reason": reason}, "blocked", html, risk)
+            errors.append(Issue("blocked", _blocked_message(reason), retryable=False))
+            return RunStatus.BLOCKED, html, rows, columns, extract_step, screenshot_note
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "inspect":
-        html = _ensure_page(browser, spec, record, risk, trajectory)
+        html = _ensure_page(browser, spec, record, risk, trajectory, remaining_ms)
+        html = _await_rendered_page(browser, spec, remaining_ms, str(args.get("selector") or selector))
         inspect_selector = str(args.get("selector") or "")
         inspected = inspect_from_html(html, inspect_selector) if inspect_selector else {}
         if inspect_selector and focus is not None:
@@ -469,9 +487,15 @@ def _apply_action(
             html,
             risk,
         )
-        if _is_auth_wall(html, spec.required_selector or inspect_selector or selector):
-            record("report_blocked", {"reason": "authentication_required"}, "blocked", html)
-            errors.append(Issue("blocked", "Target requires authentication or a mutating action the executor cannot take", retryable=False))
+        page_url = ""
+        try:
+            page_url = browser.current_url() or ""
+        except Exception:
+            page_url = ""
+        if _is_site_stop_page(html, spec.required_selector or inspect_selector, page_url):
+            reason = "authentication_required" if _is_auth_wall(html, spec.required_selector or inspect_selector, page_url) else "site_policy"
+            record("report_blocked", {"reason": reason}, "blocked", html)
+            errors.append(Issue("blocked", _blocked_message(reason), retryable=False))
             _maybe_write_html(
                 store, artifacts, html, spec, extract_step, browser=browser, trajectory=trajectory
             )
@@ -514,6 +538,7 @@ def _apply_action(
             action.type,
             remaining_ms,
             trajectory=trajectory,
+            metadata=metadata,
         )
         return status, html, rows, columns, extract_step, screenshot_note
 
@@ -722,7 +747,7 @@ def _apply_action(
         destination = _click_destination(args, browser, spec, html)
         if destination:
             browser.goto(destination)
-            html = _safe_content(browser)
+            html = _await_rendered_page(browser, spec, remaining_ms, selector)
             record(
                 "navigate",
                 {
@@ -896,6 +921,14 @@ def _apply_action(
 
     if action.type == "report_failed":
         reason = str(args.get("reason") or "Planner reported failed")
+        stop = _site_stop_status(reason)
+        if stop == RunStatus.BLOCKED:
+            record("report_blocked", args, "blocked", html, risk)
+            errors.append(Issue("blocked", reason, retryable=False))
+            _maybe_write_html(
+                store, artifacts, html, spec, extract_step, browser=browser, trajectory=trajectory
+            )
+            return worse_status(status, stop), html, rows, columns, extract_step, screenshot_note
         record("report_failed", args, "failed", html, risk)
         errors.append(Issue("failed", reason, retryable=False))
         metadata["unmet_requirements"] = _merge_unmet(
@@ -1040,14 +1073,30 @@ _SITE_STOP_TOKENS = (
     "terms",
     "paywall",
     "mutating_action",
+    "rate_threshold",
+    "rate_limit",
+    "too_many_requests",
+    "automated_access",
+    "fair_access",
+)
+_SITE_POLICY_RE = re.compile(
+    r"request rate threshold exceeded|too many requests|automated access to our sites|fair access guidelines",
+    re.I,
 )
 
 
 def _site_stop_status(reason: str) -> RunStatus:
-    blob = (reason or "").lower().replace("-", "_")
+    blob = (reason or "").lower().replace("-", "_").replace(" ", "_")
     if any(token in blob for token in _SITE_STOP_TOKENS):
         return RunStatus.BLOCKED
     return RunStatus.FAILED
+
+
+def _blocked_message(reason: str) -> str:
+    blob = (reason or "").lower().replace("-", "_").replace(" ", "_")
+    if "authentication" in blob or "auth_wall" in blob:
+        return "Target requires authentication or a mutating action the executor cannot take"
+    return "Site stopped the run (access policy, rate limit, or terms)"
 
 
 def _failed_requirement(reason: str) -> List[str]:
@@ -1291,6 +1340,7 @@ def _extract(
     action_name: str = "extract_table",
     remaining_ms: int = 0,
     trajectory: Optional[List[TrajectoryEvent]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ):
     page_url = ""
     try:
@@ -1316,18 +1366,50 @@ def _extract(
     unmet: List[str] = []
     if spec.required_columns:
         sort_spec = infer_sort_spec(spec.raw)
-        collect_limit = 0 if sort_spec.kind == "time" else spec.row_limit
-        columns, rows, method, unmet = extract_schema_rows(
-            html,
-            page_url,
-            spec.required_columns,
-            row_limit=collect_limit,
-            table_columns=table_columns,
-            table_rows=table_rows,
-            status_filters=infer_status_filters(spec.raw),
-            sort_spec=sort_spec,
-        )
-        event = record(action_name, {"selector": selector or "table", "method": method}, "ok", html)
+        status_filters = infer_status_filters(spec.raw)
+        if spec.row_limit > 0:
+            first_html = html
+            columns, rows, method, unmet, collection = collect_incremental_schema_rows(
+                browser,
+                html,
+                page_url,
+                spec.required_columns,
+                row_limit=spec.row_limit,
+                status_filters=status_filters,
+                sort_spec=sort_spec,
+                max_seconds=max(0.1, remaining_ms / 1000.0) if remaining_ms else 20.0,
+            )
+            if metadata is not None:
+                metadata["list_collection"] = _list_collection_metadata(collection)
+            html = _safe_content(browser) or html
+            if spec.row_limit > 0 and len(rows) < spec.row_limit:
+                static_cols, static_rows, static_method, static_unmet = extract_schema_rows(
+                    first_html,
+                    page_url,
+                    spec.required_columns,
+                    row_limit=spec.row_limit,
+                    table_columns=table_columns,
+                    table_rows=table_rows,
+                    status_filters=status_filters,
+                    sort_spec=sort_spec,
+                )
+                if len(static_rows) > len(rows):
+                    columns, rows, method, unmet = static_cols, static_rows, static_method, static_unmet
+        else:
+            columns, rows, method, unmet = extract_schema_rows(
+                html,
+                page_url,
+                spec.required_columns,
+                row_limit=0,
+                table_columns=table_columns,
+                table_rows=table_rows,
+                status_filters=status_filters,
+                sort_spec=sort_spec,
+            )
+        extract_args = {"selector": selector or "table", "method": method}
+        if metadata and isinstance(metadata.get("list_collection"), dict):
+            extract_args["termination_reason"] = metadata["list_collection"].get("termination_reason") or ""
+        event = record(action_name, extract_args, "ok", html)
         if (
             sort_spec.kind == "time"
             and spec.row_limit > 0
@@ -1633,18 +1715,151 @@ def _click_destination(args: Dict[str, Any], browser: Any, spec: TaskSpec, html:
     return ""
 
 
-def _is_auth_wall(html: str, selector: str) -> bool:
+_ACCESS_DENIED_RE = re.compile(
+    r"\b(401|403|unauthorized|forbidden|access denied)\b",
+    re.I,
+)
+_LOGIN_HEADING_RE = re.compile(r"\b(sign[- ]?in|log[- ]?in|login|authenticate)\b", re.I)
+_SIGNIN_HOST_RE = re.compile(r"(^|\.)(login|signin|sso|auth)\.", re.I)
+_SIGNIN_PATH_RE = re.compile(r"/(login|sign[-_]?in|sso|oauth|auth)(/|$)", re.I)
+_SEMANTIC_WAIT_SELECTORS = (
+    "main",
+    "h1",
+    "article",
+    "table",
+    "[role='search']",
+)
+
+
+def _is_signin_location(url: str) -> bool:
+    if not url:
+        return False
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    if host and _SIGNIN_HOST_RE.search(host + "."):
+        return True
+    return bool(_SIGNIN_PATH_RE.search(path))
+
+
+def _login_form_is_dominant(root, text: str) -> bool:
+    forms = query(root, "form")
+    if not any(query(form, 'input[type="password"]') for form in forms):
+        return False
+    headings = []
+    for tag in ("h1", "h2"):
+        for node in query(root, tag):
+            label = node_visible_text(node).strip()
+            if label:
+                headings.append(label)
+    titles = query(root, "title")
+    title = titles[0].text.strip() if titles else ""
+    heading_blob = " ".join(headings[:2] + ([title] if title else []))
+    if not _LOGIN_HEADING_RE.search(heading_blob):
+        return False
+    return len((text or "").split()) < 120
+
+
+def _is_site_stop_page(html: str, selector: str = "", url: str = "") -> bool:
+    if _is_auth_wall(html, selector, url):
+        return True
+    blob = html or ""
+    if _SITE_POLICY_RE.search(blob):
+        return True
+    try:
+        return bool(_SITE_POLICY_RE.search(node_visible_text(parse_html(blob))))
+    except Exception:
+        return False
+
+
+def _is_auth_wall(html: str, selector: str = "", url: str = "") -> bool:
+    if _is_signin_location(url):
+        return True
     if not html:
         return False
     try:
         root = parse_html(html)
-        if selector and query(root, selector):
-            return False
-        if query(root, "table"):
-            return False
-        return bool(query(root, 'input[type="password"]'))
     except Exception:
         return False
+    text = node_visible_text(root)
+    if _ACCESS_DENIED_RE.search(text):
+        return True
+    if selector and query(root, selector):
+        return False
+    if query(root, "table"):
+        return False
+    return _login_form_is_dominant(root, text)
+
+
+def _html_has_any(html: str, selectors: Sequence[str]) -> bool:
+    if not html:
+        return False
+    try:
+        root = parse_html(html)
+    except Exception:
+        return False
+    for selector in selectors:
+        if not selector:
+            continue
+        try:
+            if query(root, selector):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _page_has_mounted_content(html: str) -> bool:
+    if not html:
+        return False
+    if _html_has_any(html, _SEMANTIC_WAIT_SELECTORS):
+        return True
+    try:
+        root = parse_html(html)
+    except Exception:
+        return False
+    links = [
+        node
+        for node in query(root, "a")
+        if _is_navigable_href(node.attrs.get("href", ""))
+    ]
+    if len(links) >= 2:
+        return True
+    return len(node_visible_text(root).split()) >= 12
+
+
+def _await_rendered_page(browser: Any, spec, timeout_ms: int, selector: str = "") -> str:
+    budget = min(max(int(timeout_ms or 4000), 200), 8000)
+    _settle_browser(browser, budget)
+    html = _safe_content(browser)
+    if _page_has_mounted_content(html):
+        return html
+    wait_for = getattr(browser, "wait_for", None)
+    if not callable(wait_for):
+        return html
+    wanted = [item for item in (spec.required_selector, selector, *_SEMANTIC_WAIT_SELECTORS) if item]
+    union = ", ".join(dict.fromkeys(wanted))
+    try:
+        wait_for(union, min(2500, budget))
+    except Exception:
+        pass
+    return _safe_content(browser) or html
+
+
+def _list_collection_metadata(collection: Any) -> Dict[str, Any]:
+    return {
+        "termination_reason": str(getattr(collection, "termination_reason", "") or ""),
+        "requested_count": int(getattr(collection, "requested_count", 0) or 0),
+        "collected_count": int(getattr(collection, "collected_count", 0) or 0),
+        "exhausted": bool(getattr(collection, "exhausted", False)),
+        "target_reached": bool(getattr(collection, "target_reached", False)),
+        "partial": bool(getattr(collection, "partial", False)),
+        "pagination_shape": str(getattr(collection, "pagination_shape", "") or ""),
+        "duplicate_count": int(getattr(collection, "duplicate_count", 0) or 0),
+        "rounds": int(getattr(collection, "rounds", 0) or 0),
+        "elapsed_ms": int(getattr(collection, "elapsed_ms", 0) or 0),
+        "visited_urls": list(getattr(collection, "visited_urls", []) or []),
+    }
 
 
 def _maybe_write_html(
@@ -1685,6 +1900,7 @@ def _ensure_page(
     record,
     risk: str,
     trajectory: Optional[List[TrajectoryEvent]] = None,
+    remaining_ms: int = 0,
 ) -> str:
     url = ""
     try:
@@ -1696,7 +1912,7 @@ def _ensure_page(
         if html:
             return html
     browser.goto(spec.target_url)
-    html = _safe_content(browser)
+    html = _await_rendered_page(browser, spec, remaining_ms, spec.required_selector)
     record(
         "navigate",
         {"url": spec.target_url, "final_url": browser.current_url() or spec.target_url},

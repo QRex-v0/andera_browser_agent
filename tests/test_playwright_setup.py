@@ -8,6 +8,17 @@ import pytest
 from andera.agent import create_browser
 from andera.browser.playwright_browser import SETUP_COMMAND
 from andera.cli import main
+from andera.env import declared_user_agent
+
+
+def test_declared_user_agent_is_operator_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANDERA_USER_AGENT", raising=False)
+    monkeypatch.setenv("ANDERA_OPERATOR_NAME", "Andera Browser Agent")
+    monkeypatch.setenv("ANDERA_CONTACT_EMAIL", "ops@example.com")
+    ua = declared_user_agent()
+    assert ua == "Andera Browser Agent ops@example.com"
+    assert "@" in ua
+    assert "Mozilla" not in ua
 
 
 def test_missing_chromium_names_make_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

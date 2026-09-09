@@ -4,7 +4,10 @@ from pathlib import Path
 import re
 from typing import Any
 
+from andera.env import declared_user_agent
+
 SETUP_COMMAND = "make setup"
+_DECLARED_ACCEPT_ENCODING = "gzip, deflate"
 
 
 class PlaywrightBrowser:
@@ -13,10 +16,15 @@ class PlaywrightBrowser:
     VIEWPORT = {"width": 1280, "height": 720}
     LOCALE = "en-US"
     TIMEZONE = "UTC"
-    USER_AGENT = (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    )
+
+    def _context_kwargs(self) -> dict:
+        return {
+            "viewport": self.VIEWPORT,
+            "locale": self.LOCALE,
+            "timezone_id": self.TIMEZONE,
+            "user_agent": declared_user_agent(),
+            "extra_http_headers": {"Accept-Encoding": _DECLARED_ACCEPT_ENCODING},
+        }
 
     def __init__(self, headless: bool = True) -> None:
         try:
@@ -36,12 +44,7 @@ class PlaywrightBrowser:
             )
         try:
             self._browser = self._playwright.chromium.launch(headless=headless)
-            self._context = self._browser.new_context(
-                viewport=self.VIEWPORT,
-                locale=self.LOCALE,
-                timezone_id=self.TIMEZONE,
-                user_agent=self.USER_AGENT,
-            )
+            self._context = self._browser.new_context(**self._context_kwargs())
             self._page = self._context.new_page()
         except Exception as exc:
             self._playwright_cm.__exit__(None, None, None)
@@ -204,12 +207,7 @@ class PlaywrightBrowser:
             self._context.close()
         except Exception:
             pass
-        self._context = self._browser.new_context(
-            viewport=self.VIEWPORT,
-            locale=self.LOCALE,
-            timezone_id=self.TIMEZONE,
-            user_agent=self.USER_AGENT,
-        )
+        self._context = self._browser.new_context(**self._context_kwargs())
         self._page = self._context.new_page()
 
     def environment(self) -> dict:
@@ -220,7 +218,7 @@ class PlaywrightBrowser:
             "viewport": dict(self.VIEWPORT),
             "locale": self.LOCALE,
             "timezone": self.TIMEZONE,
-            "user_agent": self.USER_AGENT,
+            "user_agent": declared_user_agent(),
         }
 
     def close(self) -> None:

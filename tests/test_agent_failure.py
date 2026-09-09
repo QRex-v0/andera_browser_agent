@@ -53,6 +53,30 @@ def test_requested_screenshot_is_not_silently_dropped(agent: EvidenceAgent) -> N
     assert result.status != RunStatus.SUCCESS
 
 
+def test_rate_limit_page_is_blocked(tmp_path: Path, out_dir: Path) -> None:
+    from test_multi_target import ScriptedBrowser
+
+    page = tmp_path / "limited.html"
+    page.write_text(
+        """
+        <html><head><title>Request Rate Threshold Exceeded</title></head>
+        <body>
+          <h1>Automated access to our sites must comply with the Privacy and Security Policy.</h1>
+          <p>Please visit the fair access guidelines.</p>
+        </body></html>
+        """,
+        encoding="utf-8",
+    )
+    spec = parse_task("Collect the user access list as CSV", target_url=str(page), timeout_ms=2000)
+    result = EvidenceAgent(
+        ScriptedBrowser({page.resolve().as_uri(): page.read_text(encoding="utf-8")}),
+        out_dir,
+    ).run(spec)
+    assert result.status == RunStatus.BLOCKED
+    assert result.status != RunStatus.FAILED
+    assert any(issue.code == "blocked" for issue in result.errors)
+
+
 def test_login_wall_is_blocked(agent: EvidenceAgent) -> None:
     result = agent.run("Collect the user access list from the blocked login portal as CSV")
 

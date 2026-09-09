@@ -8,6 +8,7 @@ from andera.agent import EvidenceAgent
 from andera.list_extract import extract_schema_rows, iter_raw_records
 from andera.models import RunStatus
 from andera.parse import parse_task
+from test_multi_target import ScriptedBrowser
 from andera.schema import (
     infer_required_columns,
     infer_row_limit,
@@ -477,6 +478,79 @@ def test_missing_required_field_is_partial_not_success(agent: EvidenceAgent, tmp
     assert result.status == RunStatus.PARTIAL
     assert result.status != RunStatus.SUCCESS
     assert any("points" in issue.message for issue in result.errors)
+
+
+def test_row_limited_extract_records_target_count_reached(tmp_path: Path, out_dir: Path) -> None:
+    page2 = tmp_path / "stories-p2.html"
+    page1 = tmp_path / "stories-p1.html"
+    page2.write_text(
+        """
+        <html><body>
+          <div class="item"><a href="https://delta.example/x">Delta longer article title</a> 9 points by dan</div>
+          <div class="item"><a href="https://echo.example/y">Echo title for the fifth row</a> 3 points by ed</div>
+          <div class="item"><a href="https://foxtrot.example/z">Foxtrot should stay unused</a> 2 points by fay</div>
+        </body></html>
+        """,
+        encoding="utf-8",
+    )
+    page1.write_text(
+        f"""
+        <html><body>
+          <div class="item"><a href="https://alpha.example/post">Alpha title here</a> 42 points by alice</div>
+          <div class="item"><a href="https://beta.example/post">Beta headline about testing</a> 7 points by bob</div>
+          <div class="item"><a href="https://gamma.example/post">Gamma relative story title</a> 5 points by cara</div>
+          <a rel="next" href="{page2.resolve().as_uri()}">Next</a>
+        </body></html>
+        """,
+        encoding="utf-8",
+    )
+    pages = {
+        page1.resolve().as_uri(): page1.read_text(encoding="utf-8"),
+        page2.resolve().as_uri(): page2.read_text(encoding="utf-8"),
+    }
+    spec = parse_task(
+        "Create a CSV of the top 5 stories with title, URL, and points",
+        target_url=str(page1),
+        timeout_ms=4000,
+    )
+    result = EvidenceAgent(ScriptedBrowser(pages), out_dir).run(spec)
+    collection = result.metadata.get("list_collection") or {}
+    assert collection.get("termination_reason") == "target_count_reached"
+    assert collection.get("requested_count") == 5
+    assert collection.get("collected_count") == 5
+    assert result.metadata["row_count"] == 5
+    assert any(
+        event.action in {"extract_table", "extract_list"}
+        and event.args.get("termination_reason") == "target_count_reached"
+        for event in result.trajectory
+    )
+
+
+def test_short_source_records_exhausted_not_stopped(tmp_path: Path, out_dir: Path) -> None:
+    page = tmp_path / "stories.html"
+    page.write_text(
+        """
+        <html><body>
+          <div class="item"><a href="https://alpha.example/post">Alpha title here</a> 42 points by alice</div>
+          <div class="item"><a href="https://beta.example/post">Beta headline about testing</a> 7 points by bob</div>
+          <div class="item"><a href="https://gamma.example/post">Gamma relative story title</a> 5 points by cara</div>
+        </body></html>
+        """,
+        encoding="utf-8",
+    )
+    spec = parse_task(
+        "Create a CSV of the top 5 stories with title, URL, and points",
+        target_url=str(page),
+        timeout_ms=2000,
+    )
+    result = EvidenceAgent(ScriptedBrowser({page.resolve().as_uri(): page.read_text(encoding="utf-8")}), out_dir).run(spec)
+    collection = result.metadata.get("list_collection") or {}
+    assert collection.get("termination_reason") == "source_exhausted"
+    assert collection.get("collected_count") == 3
+    assert collection.get("requested_count") == 5
+    assert result.metadata["row_count"] == 3
+    assert result.status == RunStatus.PARTIAL
+    assert result.status != RunStatus.SUCCESS
 
 
 def test_production_modules_do_not_hardcode_eval_sites() -> None:

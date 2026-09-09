@@ -138,8 +138,6 @@ class RulePlanner:
             return BrowserAction("navigate", {"url": spec.target_url})
         if "inspect" not in done:
             return BrowserAction("inspect", {})
-        if observation.get("has_password") and not observation.get("has_table"):
-            return BrowserAction("report_blocked", {"reason": "authentication_required"})
         selector = spec.required_selector or "table"
         extracted = bool({"extract_table", "extract_list"} & done)
         asking = ("text_extract" in spec.artifact_types or "answer" in spec.artifact_types) and "csv" not in spec.artifact_types

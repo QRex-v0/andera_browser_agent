@@ -40,6 +40,17 @@ def openai_api_key() -> str:
     return key
 
 
+def declared_user_agent() -> str:
+    """Operator identity for automated HTTP requests: 'Name contact@domain'."""
+    load_local_env()
+    explicit = (os.environ.get("ANDERA_USER_AGENT") or "").strip()
+    if explicit:
+        return explicit
+    name = (os.environ.get("ANDERA_OPERATOR_NAME") or "Andera Browser Agent").strip()
+    contact = (os.environ.get("ANDERA_CONTACT_EMAIL") or "qinyu.whom@gmail.com").strip()
+    return f"{name} {contact}".strip()
+
+
 def _load_file(path: Path) -> None:
     if not path.is_file():
         return
