@@ -1,8 +1,8 @@
 # Andera Browser Agent
 
-Andera Browser Agent executes audit data collection tasks in a browser and emits reviewer-ready evidence artifacts, with explicit status reporting and verifier-driven quality control.
+Andera Browser Agent executes browser evidence collection tasks and emits reviewer-ready artifacts while refusing credential handling and mutating actions by design.
 
-The project is no longer a fixture-only demo. It supports live navigation and multi-page flows, and it treats evidence as auditable facts rather than extracted text only.
+The project supports live navigation and multi-page workflows, and it treats evidence as auditable facts rather than extracted text only.
 
 ## Current implementation
 
@@ -57,15 +57,15 @@ The verifier checks existence, PNG validity, and plausible dimensions. A “full
 
 ## What we learned by running it
 
-- Provenance paid off immediately. In a multi-site task, all three screenshots were from the same site, while provenance consistently showed true per-artifact source URLs. The mismatch was machine-detectable and visible because provenance was field-level.
+- Provenance paid off immediately. In a multi-site task, all three screenshots came from the same site, while provenance consistently showed the true source URL for every artifact. But nothing compared an artifact’s recorded origin to the target it was filed under, so the mismatch was not machine-detected. This is the same failure shape as unconsumed observation digest in the next bullet.
 - Collected-but-unconsumed signal recurs. The executor logs observation digests each step but does not compare them, so a stalled loop can exhaust steps and end as `timeout`. Recording signal is not equivalent to acting on it.
 - The verifier contract has an unresolved circular dependency. It currently verifies against the planner-produced `TaskSpec`, so it checks “what the agent said it would do” rather than “what the operator asked.” If the planner omits requirements, no check is created for them. The intended fix is a deterministic contract extraction from the request, with the model only allowed to add requirements.
-- Status semantics still need one separation: `blocked` should mean external stop conditions (auth wall, 403, terms), while `failed` should mean capability gap. A current SEC EDGAR run is marked `blocked` where it should be `failed` because the auth-wall heuristic misclassifies “content has not rendered yet.”
+- Status semantics still need one separation: `blocked` should mean external stop conditions (auth wall, 403, terms), while `failed` should mean capability gap. A current SEC EDGAR run is marked `blocked` where it should be `failed` because the auth-wall heuristic misclassifies “content has not rendered yet.” The run only took two steps: navigate, snapshot, stop. It never searched, clicked, or downloaded. We chose not to hardcode an SEC EDGAR path to make this task pass, because that would only add a one-off win and no reusable capability; hidden evaluations use unseen sites.
 
 ## Out of scope (explicitly)
 
 - x.com timeline and LinkedIn profiles. These require authenticated sessions and conflict with site terms. Adding a hosted logged-in profile would reduce technical barrier but not legal/operational constraint.
-- Student roster collection (sorority task). Personal data collection is intentionally excluded for compliance posture.
+- Student roster collection (sorority task). Collecting personal information about identifiable individuals is out of scope for a compliance product regardless of technical accessibility; declining to collect is the design decision, not a missing capability.
 - Airbnb listings. Date-picker automation was omitted by design and should be considered future work.
 
 ## Authentication model
@@ -91,7 +91,8 @@ Python 3.9+ is required. Common run path:
 ```bash
 make setup
 source .venv/bin/activate
-python -m andera run "Collect the last 20 merged GitHub pull requests and a full-page screenshot" --browser playwright --planner openai
+python -m andera run "Create a CSV of the top 5 stories on Hacker News with title, URL, and points, and take a full page screenshot" --browser playwright
+python -m andera run "Collect an availability check for Figma, GitHub, and Atlassian. Return a CSV with Company, Observed Status, Final URL, and Evidence Reference. Capture screenshots for each site." --browser playwright --planner openai
 ```
 
 Switch to fixture execution for deterministic local validation when needed. In all modes, failures should include explicit status, artifact paths, and verifier findings.
