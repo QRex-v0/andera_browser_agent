@@ -233,9 +233,16 @@ def _apply_action(
     screenshot_note = ""
 
     if action.type == "navigate":
-        browser.goto(str(args.get("url") or spec.target_url))
+        requested = str(args.get("url") or spec.target_url)
+        browser.goto(requested)
         html = _safe_content(browser)
-        record("navigate", {"url": spec.target_url}, "ok", html, risk)
+        record(
+            "navigate",
+            {"url": requested, "final_url": browser.current_url() or requested},
+            "ok",
+            html,
+            risk,
+        )
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "inspect":
@@ -433,7 +440,13 @@ def _ensure_page(browser: Any, spec: TaskSpec, record, risk: str) -> str:
             return html
     browser.goto(spec.target_url)
     html = _safe_content(browser)
-    record("navigate", {"url": spec.target_url}, "ok", html, risk)
+    record(
+        "navigate",
+        {"url": spec.target_url, "final_url": browser.current_url() or spec.target_url},
+        "ok",
+        html,
+        risk,
+    )
     return html
 
 
@@ -482,9 +495,14 @@ def _outcome(
     started_at: str,
     env: Dict[str, Any],
 ) -> ExecutionOutcome:
+    final_url = browser.current_url() or spec.target_url
+    metadata["requested_url"] = spec.target_url
+    metadata["final_url"] = final_url
     return ExecutionOutcome(
         provisional_status=status,
-        target_url=browser.current_url() or spec.target_url,
+        target_url=final_url,
+        requested_url=spec.target_url,
+        final_url=final_url,
         html=html,
         rows=rows,
         columns=columns,

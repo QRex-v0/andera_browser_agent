@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
 from andera.models import (
     Artifact,
@@ -78,14 +79,25 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
             RunStatus.PARTIAL,
         )
 
-    visited = _visited_urls(outcome)
-    source_ok = not outcome.target_url or any(
-        _urls_match(outcome.target_url, item) for item in visited
-    ) or bool(outcome.html)
+    requested = spec.target_url
+    final_url = outcome.final_url or outcome.target_url
+    source_ok = bool(requested) and (
+        urls_equivalent(requested, final_url)
+        or any(urls_equivalent(requested, item) for item in _visited_urls(outcome))
+    )
     record(
         "source_visited",
         source_ok,
-        "Source URL was visited" if source_ok else f"Did not visit {outcome.target_url}",
+        "Requested source URL was visited" if source_ok else f"Did not visit requested URL {requested}",
+        RunStatus.FAILED,
+    )
+    host_ok = not requested or not final_url or hosts_equivalent(requested, final_url)
+    record(
+        "source_host",
+        host_ok,
+        "Final host matches the requested host"
+        if host_ok
+        else f"Host redirected from {_host(requested)!r} to {_host(final_url)!r}",
         RunStatus.FAILED,
     )
 
@@ -138,16 +150,41 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
 
 
 def _visited_urls(outcome: ExecutionOutcome) -> List[str]:
-    urls = [outcome.target_url]
+    urls: List[str] = []
+    if outcome.final_url:
+        urls.append(outcome.final_url)
     for event in outcome.trajectory:
         if event.url:
             urls.append(event.url)
         if event.action == "navigate":
-            target = event.args.get("url")
-            if target:
-                urls.append(str(target))
+            landed = event.args.get("final_url")
+            if landed:
+                urls.append(str(landed))
     return urls
 
 
-def _urls_match(expected: str, actual: str) -> bool:
-    return expected.rstrip("/") == actual.rstrip("/") or expected in actual or actual in expected
+def url_parts(url: str) -> Tuple[str, str, str]:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/") or "/"
+    return parsed.scheme.lower(), host, path
+
+
+def urls_equivalent(expected: str, actual: str) -> bool:
+    if not expected or not actual:
+        return False
+    return url_parts(expected) == url_parts(actual)
+
+
+def hosts_equivalent(expected: str, actual: str) -> bool:
+    if not expected or not actual:
+        return False
+    expected_scheme, expected_host, _ = url_parts(expected)
+    actual_scheme, actual_host, _ = url_parts(actual)
+    if not expected_host and not actual_host:
+        return expected_scheme == actual_scheme
+    return expected_scheme == actual_scheme and expected_host == actual_host
+
+
+def _host(url: str) -> str:
+    return url_parts(url)[1]

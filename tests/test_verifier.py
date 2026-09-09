@@ -81,6 +81,77 @@ def test_verifier_rejects_success_without_screenshot() -> None:
     assert any(check.code == "required_screenshot" and not check.passed for check in report.checks)
 
 
+def test_verifier_rejects_success_when_final_host_differs() -> None:
+    rows = [{"Name": "Ada"}]
+    report = verify(
+        _spec(target_url="https://www.airbnb.com/s/Lake-Tahoe"),
+        _outcome(
+            target_url="https://zh.airbnb.com/s/Lake-Tahoe",
+            requested_url="https://www.airbnb.com/s/Lake-Tahoe",
+            final_url="https://zh.airbnb.com/s/Lake-Tahoe",
+            html="<html><table><tr><td>Ada</td></tr></table></html>",
+            rows=rows,
+            columns=["Name"],
+            artifacts=[
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=40, sha256="ab"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+            ],
+        ),
+        provenance={
+            "fields": [
+                {
+                    "path": "csv.rows[0].Name",
+                    "value": "Ada",
+                    "evidence_refs": ["sha256:ab"],
+                    "source_locator": {"row": 0, "column": "Name"},
+                }
+            ]
+        },
+    )
+    assert report.status != RunStatus.SUCCESS
+    assert report.status == RunStatus.FAILED
+    assert any(check.code == "source_host" and not check.passed for check in report.checks)
+    assert any(check.code == "source_visited" and not check.passed for check in report.checks)
+
+
+def test_verifier_does_not_treat_url_substring_as_a_visit() -> None:
+    report = verify(
+        _spec(target_url="https://example.test"),
+        _outcome(
+            target_url="https://example.test.attacker.example/table",
+            requested_url="https://example.test",
+            final_url="https://example.test.attacker.example/table",
+            html="<html>captured</html>",
+            artifacts=[
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=20, sha256="ab"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+            ],
+        ),
+        provenance={"fields": []},
+    )
+    assert report.status != RunStatus.SUCCESS
+    assert any(check.code == "source_visited" and not check.passed for check in report.checks)
+
+
+def test_verifier_accepts_same_host_and_path() -> None:
+    report = verify(
+        _spec(target_url="https://example.test/table"),
+        _outcome(
+            target_url="https://example.test/table/",
+            requested_url="https://example.test/table",
+            final_url="https://example.test/table/",
+            html="<html>ok</html>",
+            artifacts=[
+                Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab"),
+                Artifact(type="csv", path="table.csv", description="", bytes=8, sha256="cd"),
+            ],
+        ),
+        provenance={"fields": []},
+    )
+    assert any(check.code == "source_visited" and check.passed for check in report.checks)
+    assert any(check.code == "source_host" and check.passed for check in report.checks)
+
+
 def test_verifier_never_upgrades_timeout() -> None:
     report = verify(
         _spec(),
