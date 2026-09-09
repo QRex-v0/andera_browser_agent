@@ -14,7 +14,9 @@ from andera.schema import (
     infer_screenshot_roles,
     infer_screenshot_scope,
     needs_most_recent,
+    needs_answer,
     needs_screenshot,
+    needs_text_extract,
     wants_tabular,
 )
 from andera.targets import official_homepage
@@ -31,6 +33,7 @@ ALLOWED_ACTIONS = (
     "extract_table",
     "extract_list",
     "extract_text",
+    "answer",
     "screenshot",
     "open_content_index",
     "open_most_recent",
@@ -55,6 +58,7 @@ Set timeout_ms to at least 300000 for live public websites.
 Never include secrets or API keys.
 Prefer generic evidence requirements such as a visible data table, CSV, HTML snapshot, or screenshot.
 If the request implies a visual record — explicitly ("take a screenshot") or implicitly ("show the site is still live", "capture the page") — include "screenshot" in artifact_types and set screenshot_scope to "viewport" or "full_page".
+If the task asks to return a passage verbatim ("return the full text", "highlighted portion"), include "text_extract" in artifact_types. If the task asks a question that needs a conclusion ("what is", "what does it do", "summarize"), include both "text_extract" and "answer". A question with no answer is unmet. Do not treat a raw page extract as the answer.
 Use full_page when the request says "full page" or the target content plausibly extends past one screen (lists, tables, long pages). Use viewport only when the operator asks for the visible viewport. Truncated page captures are incomplete evidence.
 If the task names several companies or sites, emit a targets array with each official public homepage URL. Do not include blog, press, newsroom, or media paths; those pages are discovered at runtime from the homepage.
 When the task asks for the website and the most recent published content, set screenshot_roles to homepage and latest_content. Do not request a CSV unless the operator asked for tabular output.
@@ -63,6 +67,9 @@ When the task asks for the website and the most recent published content, set sc
 DECIDE_INSTRUCTIONS = """You are the executor planner for a read-only audit evidence browser agent.
 Given the TaskSpec, compact DOM/accessibility observation, and prior actions, choose the next typed browser action.
 Prefer accessibility/DOM observations. If artifact_types includes screenshot, emit a screenshot action that honors screenshot_scope and the next missing screenshot_role before done_subgoal. Request an extra screenshot only if the page is visual, ambiguous, or not table-like.
+If a page is too large to summarize, emit inspect with a selector for the one element you need to read. The next observation.inspect contains that element's text, attributes, and immediate children. Do not inspect the same selector twice.
+If artifact_types includes text_extract, emit extract_text to capture a passage verbatim. That raw extract is evidence, not an answer.
+If artifact_types includes answer, extract first, then emit answer with a concise conclusion in the text field that cites facts from observation.extract. Do not copy the extract. Do not emit answer before extract_text. A question with no answer is incomplete.
 Choose only the next single action from the current observation. Do not emit a full script.
 If a required control is missing, wait once for asynchronously rendered content before concluding it is absent.
 If a newsroom, press, media, blog, or content index is required, follow a link that is visible in the observation, including footer and menu links. Do not invent a path. If content_index_links names one, use that. If the destination URL is already known, emit navigate with that url — do not click a footer or in-page link just to reach it. If you cannot name the link from its visible text, report_failed — do not click a guess.
@@ -71,13 +78,14 @@ If the most recent item is required, rank dated items by parsed date, not docume
 Identify an element by what it says, not by where it sits in the markup. A click, type, or select locator must name one element — role plus accessible name, or visible link/button text (for example a:has-text("Blog") or role=link[name="Newsroom"]). A bare tag name such as a, div, button, or span is not a locator and is not acceptable. Do not use site-specific CSS paths or nth-child guesses.
 Read-only: do not submit, approve, purchase, delete, or type into password fields.
 If list_candidates is nonempty, do not wait for a table; emit extract_table or extract_list.
+When extracting a list, select the repeating container that holds the items — a list, feed, table, or row group — not an enumeration of the titles currently on screen. Do not bake page content into a locator. Enumerating visible items cannot reach anything behind scrolling or pagination, and titles with punctuation will not match.
 If the task requires a filtered subset such as merged or closed items, apply that filter using a visible control, search field, or matching href before extracting. Do not extract an unfiltered list.
 If last/first/newest refers to an event time, do not treat the current list order as that ranking. Obtain the event time from the list or from each item's detail page, then sort.
 If a required field is not visible on the current list, it is unobserved. Visit each item's detail page rather than inventing or defaulting the value. Follow a related in-page link when the missing field names a subpage such as commits.
 Do not invent field values. Do not write none/unknown for a field that was not observed. If a required field is not visible, leave it empty so verification can fail.
 If a field is ambiguous, keep the ambiguity visible in the output instead of silently choosing one interpretation.
 When a download is required for a dated filing or report, use a download action with selector and text filters (match_text/match_date) that disambiguate the target before click.
-When evidence is collected, emit done_subgoal. If extract_table or extract_list already ran, emit done_subgoal instead of extracting again.
+When evidence is collected, emit done_subgoal. If extract_table or extract_list already ran, emit done_subgoal instead of extracting again. If answer is required, do not done_subgoal until answer has been written.
 Return JSON only.
 """
 
@@ -134,15 +142,22 @@ class RulePlanner:
             return BrowserAction("report_blocked", {"reason": "authentication_required"})
         selector = spec.required_selector or "table"
         extracted = bool({"extract_table", "extract_list"} & done)
+        asking = ("text_extract" in spec.artifact_types or "answer" in spec.artifact_types) and "csv" not in spec.artifact_types
         if (
             "wait" not in done
             and not extracted
             and not observation.get("has_list")
             and not spec.required_columns
+            and not asking
         ):
             return BrowserAction("wait", {"selector": selector, "timeout_ms": spec.timeout_ms})
         if "csv" in spec.artifact_types and not extracted:
             return BrowserAction("extract_table", {"selector": selector})
+        if "text_extract" in spec.artifact_types and "extract_text" not in done:
+            return BrowserAction("extract_text", {"selector": spec.required_selector or "article, main, body"})
+        if "answer" in spec.artifact_types and "answer" not in done:
+            material = str((observation.get("extract") or {}).get("text") or "")
+            return BrowserAction("answer", {"text": _rule_answer(spec.raw, material)})
         missing = _missing_screenshot_role(spec, trajectory)
         if missing:
             return BrowserAction(
@@ -184,6 +199,16 @@ class OpenAIPlanner:
             artifacts = [item for item in artifacts if item != "screenshot"]
         if not wants_tabular(message):
             artifacts = [item for item in artifacts if item != "csv"]
+        if needs_text_extract(message):
+            if "text_extract" not in artifacts:
+                artifacts.append("text_extract")
+        else:
+            artifacts = [item for item in artifacts if item != "text_extract"]
+        if needs_answer(message):
+            if "answer" not in artifacts:
+                artifacts.append("answer")
+        else:
+            artifacts = [item for item in artifacts if item not in {"answer", "text_answer"}]
         if "html_snapshot" not in artifacts:
             artifacts.append("html_snapshot")
         targets = _planned_targets(message, payload, target_url)
@@ -297,6 +322,13 @@ class OpenAIPlanner:
             args["url"] = spec.target_url
         if action_type in {"wait", "extract_table"} and "selector" not in args:
             args["selector"] = spec.required_selector or "table"
+        if action_type == "extract_text" and "selector" not in args:
+            inspect = observation.get("inspect") if isinstance(observation.get("inspect"), dict) else {}
+            args["selector"] = (
+                spec.required_selector
+                or (str(inspect.get("selector") or "") if inspect.get("found") else "")
+                or "article, main, body"
+            )
         if action_type == "download":
             if "match_date" not in args:
                 date_value = _infer_match_date(spec.raw)
@@ -491,8 +523,9 @@ def _planned_targets(message: str, payload: Dict[str, Any], operator_url: str | 
 
 def _with_screenshot_requirement(requirements: List[str], artifacts: List[str]) -> List[str]:
     result = list(requirements)
-    if "screenshot" in artifacts and "screenshot" not in result:
-        result.append("screenshot")
+    for name in ("screenshot", "text_extract", "answer"):
+        if name in artifacts and name not in result:
+            result.append(name)
     return result
 
 
@@ -502,6 +535,9 @@ def _normalize_artifact_types(values: List[str]) -> List[str]:
         "snapshot": "html_snapshot",
         "screen_shot": "screenshot",
         "screen-shot": "screenshot",
+        "extracted_text": "text_extract",
+        "text_answer": "answer",
+        "conclusion": "answer",
     }
     result: List[str] = []
     for item in values:
@@ -655,3 +691,15 @@ def _infer_match_text(text: str) -> str:
     if "8-k" in lowered.replace(" ", ""):
         return "8-k"
     return ""
+
+
+def _rule_answer(task: str, material: str) -> str:
+    cleaned = re.sub(r"\s+", " ", material or "").strip()
+    if not cleaned:
+        return ""
+    match = re.match(r"(.{1,240}?[.!?])(?:\s|$)", cleaned)
+    lead = match.group(1).strip() if match else cleaned[:240].strip()
+    prose = f"From the captured passage: {lead}"
+    if len(prose) == len(cleaned):
+        prose = f"Answer to {task.strip()}: {lead}"
+    return prose

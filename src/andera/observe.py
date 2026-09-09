@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Dict, List
 
-from andera.html_query import parse_html, query, table_to_rows
+from andera.html_query import node_visible_text, parse_html, query, table_to_rows
 from andera.content_index import list_content_index_candidates
 from andera.list_extract import preview_records
 
@@ -85,15 +85,70 @@ def observation_from_html(url: str, html: str) -> Dict[str, Any]:
     return observed
 
 
+def inspect_from_html(html: str, selector: str) -> Dict[str, Any]:
+    """Resolve one element and return its text, attributes, and immediate children."""
+    payload: Dict[str, Any] = {
+        "selector": selector,
+        "found": False,
+        "tag": "",
+        "attrs": {},
+        "text": "",
+        "children": [],
+    }
+    if not html or not selector:
+        return payload
+    matches = query(parse_html(html), selector)
+    if not matches:
+        return payload
+    node = matches[0]
+    attrs = {}
+    for key, value in (node.attrs or {}).items():
+        if key.lower() == "type" and str(value).lower() == "password":
+            continue
+        attrs[key] = str(value)[:300]
+    children = []
+    for child in (node.children or [])[:16]:
+        children.append(
+            {
+                "tag": child.tag,
+                "id": child.attrs.get("id", ""),
+                "href": (child.attrs.get("href") or "")[:200],
+                "text": node_visible_text(child)[:400],
+            }
+        )
+    links = []
+    for child in query(node, "a")[:8]:
+        href = (child.attrs.get("href") or "")[:200]
+        if href:
+            links.append({"text": node_visible_text(child)[:200], "href": href})
+    payload.update(
+        {
+            "found": True,
+            "tag": node.tag,
+            "attrs": attrs,
+            "text": node_visible_text(node)[:4000],
+            "children": children,
+            "links": links,
+        }
+    )
+    return payload
+
+
 def observation_digest(observation: Dict[str, Any]) -> str:
-    """Stable page identity used to detect a stuck loop. Viewport chrome is ignored."""
+    """Page identity plus any focused inspect/extract, so a closer look is new information."""
     url = str(observation.get("url") or "")
     links = observation.get("content_index_links") or []
+    focused = observation.get("inspect") or {}
+    extracted = observation.get("extract") or {}
     payload = "|".join(
         [
             str(observation.get("title") or ""),
             str(observation.get("text_excerpt") or "")[:800],
             ",".join(f"{item.get('text', '')}>{item.get('href', '')}" for item in links[:16]),
+            str(focused.get("selector") or ""),
+            str(focused.get("text") or "")[:400],
+            str(extracted.get("selector") or ""),
+            str(extracted.get("sha256") or extracted.get("chars") or ""),
         ]
     )
     return hashlib.sha256(f"{url}\n{payload}".encode("utf-8", errors="replace")).hexdigest()

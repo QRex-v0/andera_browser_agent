@@ -13,7 +13,9 @@ from andera.schema import (
     infer_row_limit,
     infer_screenshot_roles,
     infer_screenshot_scope,
+    needs_answer,
     needs_screenshot,
+    needs_text_extract,
     wants_tabular,
 )
 
@@ -104,6 +106,10 @@ def _infer_artifacts(text: str) -> list[str]:
         artifacts.append("download")
     if needs_screenshot(text):
         artifacts.append("screenshot")
+    if needs_text_extract(text):
+        artifacts.append("text_extract")
+    if needs_answer(text):
+        artifacts.append("answer")
     if "html" in lowered or "snapshot" in lowered:
         artifacts.append("html_snapshot")
     if not artifacts:

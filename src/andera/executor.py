@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from andera.evidence import EvidenceStore, extract_table_schema
+from andera.evidence import EvidenceStore, extract_table_schema, extract_visible_text, sha256_hex
 from andera.html_query import node_visible_text, parse_html, query
 from andera.content_index import _absolutize, discover_content_index, iter_content_items, resolve_most_recent
 from andera.list_extract import (
@@ -32,7 +32,7 @@ from andera.models import (
     worse_status,
 )
 from andera.schema import infer_sort_spec, infer_status_filters, split_unmet_fields
-from andera.observe import observation_digest, observation_from_html
+from andera.observe import inspect_from_html, observation_digest, observation_from_html
 from andera.planner import Planner, RulePlanner, _missing_screenshot_role
 from andera.targets import listed_targets, target_slug
 from andera.verifier import artifact_origin_matches, hosts_equivalent, origin_host
@@ -102,6 +102,7 @@ def execute(
     screenshot_note = ""
     digest_history: List[str] = []
     changed_strategy = False
+    focus: Dict[str, Any] = {}
     env = _environment(browser)
     requested_types = {str(item).lower() for item in spec.artifact_types}
     metadata: Dict[str, Any] = {
@@ -151,10 +152,10 @@ def execute(
             try:
                 observed = dict(getter())
                 observed.setdefault("url", browser.current_url() or spec.target_url)
-                return observed
+                return _with_focus(observed, focus)
             except Exception:
                 pass
-        return observation_from_html(browser.current_url() or spec.target_url, page_html)
+        return _with_focus(observation_from_html(browser.current_url() or spec.target_url, page_html), focus)
 
     while len(trajectory) < spec.step_budget:
         if remaining_ms() <= 0:
@@ -261,6 +262,7 @@ def execute(
                 risk=risk,
                 metadata=metadata,
                 trajectory=trajectory,
+                focus=focus,
             )
         except FileNotFoundError as exc:
             record(action.type, action.args, "error", html, risk)
@@ -428,12 +430,15 @@ def _apply_action(
     risk: str,
     metadata: Dict[str, Any],
     trajectory: List[TrajectoryEvent],
+    focus: Optional[Dict[str, Any]] = None,
 ) -> tuple:
     args = dict(action.args)
     selector = str(args.get("selector") or spec.required_selector or "table")
     screenshot_note = ""
 
     if action.type == "navigate":
+        if focus is not None:
+            focus.pop("inspect", None)
         requested = str(args.get("url") or spec.target_url)
         browser.goto(requested)
         html = _safe_content(browser)
@@ -448,8 +453,23 @@ def _apply_action(
 
     if action.type == "inspect":
         html = _ensure_page(browser, spec, record, risk, trajectory)
-        record("inspect", {"selector": selector}, "ok", html, risk)
-        if _is_auth_wall(html, spec.required_selector or selector):
+        inspect_selector = str(args.get("selector") or "")
+        inspected = inspect_from_html(html, inspect_selector) if inspect_selector else {}
+        if inspect_selector and focus is not None:
+            focus["inspect"] = inspected
+        record(
+            "inspect",
+            {
+                "selector": inspect_selector,
+                "found": bool(inspected.get("found")),
+                "tag": inspected.get("tag") or "",
+                "chars": len(str(inspected.get("text") or "")),
+            },
+            "ok" if not inspect_selector or inspected.get("found") else "empty",
+            html,
+            risk,
+        )
+        if _is_auth_wall(html, spec.required_selector or inspect_selector or selector):
             record("report_blocked", {"reason": "authentication_required"}, "blocked", html)
             errors.append(Issue("blocked", "Target requires authentication or a mutating action the executor cannot take", retryable=False))
             _maybe_write_html(
@@ -752,8 +772,112 @@ def _apply_action(
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "extract_text":
-        html = _safe_content(browser)
-        record("extract_text", {"selector": selector}, "ok", html, risk)
+        html = _ensure_page(browser, spec, record, risk, trajectory)
+        current_url = ""
+        try:
+            current_url = browser.current_url() or ""
+        except Exception:
+            current_url = ""
+        text_selector = str(args.get("selector") or spec.required_selector or "")
+        if not page_belongs_to_target(current_url, spec.target_url, trajectory):
+            record(
+                "extract_text",
+                {"selector": text_selector, "url": current_url, "reason": "wrong_host"},
+                "rejected",
+                html,
+                risk,
+            )
+            return status, html, rows, columns, extract_step, screenshot_note
+        text, used = extract_visible_text(html, text_selector)
+        if not text:
+            record(
+                "extract_text",
+                {"selector": text_selector or used, "reason": "empty"},
+                "failed",
+                html,
+                risk,
+            )
+            errors.append(
+                Issue("incomplete_evidence", "extract_text captured no text from the resolved selector", retryable=False)
+            )
+            metadata["unmet_requirements"] = _merge_unmet(metadata, ["text_extract"])
+            return worse_status(status, RunStatus.PARTIAL), html, rows, columns, extract_step, screenshot_note
+        if any(item.type == "text_extract" for item in artifacts):
+            record("extract_text", {"selector": used, "skipped": "already_have_text"}, "skipped", html, risk)
+            return status, html, rows, columns, extract_step, screenshot_note
+        event = record(
+            "extract_text",
+            {"selector": used, "chars": len(text), "url": current_url},
+            "ok",
+            html,
+            risk,
+        )
+        artifact = store.write_text_artifact(
+            "text_extract",
+            "evidence/text-extract.txt",
+            text,
+            "Verbatim extracted passage",
+            source_url=current_url,
+            trajectory_step=event.step,
+        )
+        artifacts.append(artifact)
+        if focus is not None:
+            focus["extract"] = {
+                "selector": used,
+                "chars": len(text),
+                "sha256": artifact.sha256,
+                "path": artifact.path,
+                "text": text[:8000],
+            }
+        extract_step = event.step
+        return status, html, rows, columns, extract_step, screenshot_note
+
+    if action.type == "answer":
+        if any(item.type == "answer" for item in artifacts):
+            record("answer", {"skipped": "already_have_answer"}, "skipped", html, risk)
+            return status, html, rows, columns, extract_step, screenshot_note
+        prose = str(args.get("text") or args.get("answer") or "").strip()
+        extracts = [item for item in artifacts if item.type == "text_extract"]
+        if not extracts:
+            record("answer", {"reason": "no_extract"}, "failed", html, risk)
+            errors.append(
+                Issue("incomplete_evidence", "answer requires a prior text_extract", retryable=False)
+            )
+            metadata["unmet_requirements"] = _merge_unmet(metadata, ["answer"])
+            return worse_status(status, RunStatus.PARTIAL), html, rows, columns, extract_step, screenshot_note
+        source = extracts[-1]
+        source_text = ""
+        try:
+            source_text = Path(source.path).read_text(encoding="utf-8")
+        except Exception:
+            source_text = str((focus or {}).get("extract", {}).get("text") or "")
+        if not prose:
+            record("answer", {"reason": "empty", "extract_sha256": source.sha256}, "failed", html, risk)
+            errors.append(Issue("incomplete_evidence", "answer was empty", retryable=False))
+            metadata["unmet_requirements"] = _merge_unmet(metadata, ["answer"])
+            return worse_status(status, RunStatus.PARTIAL), html, rows, columns, extract_step, screenshot_note
+        event = record(
+            "answer",
+            {
+                "chars": len(prose),
+                "extract_sha256": source.sha256,
+                "extract_chars": len(source_text),
+            },
+            "ok",
+            html,
+            risk,
+        )
+        artifacts.append(
+            store.write_text_artifact(
+                "answer",
+                "evidence/answer.txt",
+                prose,
+                "Answer derived from captured extract",
+                source_url=source.source_url,
+                trajectory_step=event.step,
+            )
+        )
+        metadata["answer_extract_sha256"] = source.sha256
         return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "checkpoint":
@@ -937,6 +1061,16 @@ def _failed_requirement(reason: str) -> List[str]:
     return []
 
 
+def _with_focus(observation: Dict[str, Any], focus: Dict[str, Any]) -> Dict[str, Any]:
+    observed = dict(observation)
+    if focus.get("inspect"):
+        observed["inspect"] = focus["inspect"]
+    if focus.get("extract"):
+        observed["extract"] = focus["extract"]
+    observed["digest"] = observation_digest(observed)
+    return observed
+
+
 def _same_target_page(left: str, right: str) -> bool:
     return (left or "").rstrip("/") == (right or "").rstrip("/")
 
@@ -973,6 +1107,7 @@ _LOOP_ESCAPE_ACTIONS = {
     "extract_table",
     "extract_list",
     "extract_text",
+    "answer",
     "screenshot",
     "open_content_index",
     "open_most_recent",
@@ -1071,6 +1206,10 @@ def _requirements_satisfied(
     if "csv" in types and spec.expect_rows and not rows:
         return False
     if "download" in types and not any(item.type == "download" for item in artifacts):
+        return False
+    if "text_extract" in types and not any(item.type == "text_extract" for item in artifacts):
+        return False
+    if "answer" in types and not any(item.type == "answer" for item in artifacts):
         return False
     if _missing_screenshot_role(spec, trajectory):
         return False
@@ -1345,6 +1484,7 @@ def classify_risk(action_type: str, label: str = "") -> str:
         "extract_table",
         "extract_list",
         "extract_text",
+        "answer",
         "screenshot",
         "open_content_index",
         "open_most_recent",

@@ -148,6 +148,36 @@ def wants_tabular(text: str) -> bool:
     return bool(re.search(r"\b(?:csv|spreadsheet|table|access list)\b", text or "", re.I))
 
 
+_VERBATIM_EXTRACT_HINTS = (
+    r"\breturn the full text\b",
+    r"\bfull text in the highlighted\b",
+    r"\bhighlighted portion\b",
+)
+_ANSWER_HINTS = (
+    r"\bwhat(?:'s|s|\s+is|\s+are|\s+does|\s+do)\b",
+    r"\bsummarize\b",
+    r"\b(?:who|why|how|which)\b.+\?",
+)
+
+
+def needs_verbatim_extract(text: str) -> bool:
+    source = text or ""
+    return any(re.search(pattern, source, re.I) for pattern in _VERBATIM_EXTRACT_HINTS)
+
+
+def needs_answer(text: str) -> bool:
+    source = text or ""
+    return any(re.search(pattern, source, re.I) for pattern in _ANSWER_HINTS)
+
+
+def needs_text_extract(text: str) -> bool:
+    return needs_verbatim_extract(text) or needs_answer(text)
+
+
+def needs_text_answer(text: str) -> bool:
+    return needs_text_extract(text)
+
+
 def infer_row_limit(text: str) -> int:
     match = ROW_LIMIT_RE.search(text or "")
     if not match:

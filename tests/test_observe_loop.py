@@ -133,6 +133,8 @@ def test_vague_locator_rejects_bare_tags_but_allows_named_controls() -> None:
     assert "what it says" in DECIDE_INSTRUCTIONS
     assert "do not revisit them" in DECIDE_INSTRUCTIONS
     assert "first in document order" in DECIDE_INSTRUCTIONS
+    assert "repeating container" in DECIDE_INSTRUCTIONS
+    assert "observation.inspect" in DECIDE_INSTRUCTIONS
 
 
 def test_click_with_known_url_navigates_instead_of_clicking(tmp_path: Path, out_dir: Path) -> None:

@@ -15,9 +15,16 @@ from andera.models import (
     VerifierReport,
     worse_status,
 )
-from andera.schema import column_type, is_absolute_http_url, parse_integer, split_unmet_fields
+from andera.schema import (
+    column_type,
+    is_absolute_http_url,
+    needs_answer,
+    needs_text_extract,
+    parse_integer,
+    split_unmet_fields,
+)
 
-_EVIDENCE_ARTIFACT_TYPES = {"screenshot", "html_snapshot", "csv", "download"}
+_EVIDENCE_ARTIFACT_TYPES = {"screenshot", "html_snapshot", "csv", "download", "text_extract", "answer"}
 
 
 def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict] = None) -> VerifierReport:
@@ -154,6 +161,93 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
                 _check_screenshot(spec, outcome, item, record)
         elif expected == 0:
             _check_screenshot(spec, outcome, None, record)
+
+    if "text_extract" in requested_types or needs_text_extract(spec.raw):
+        extracts = [item for item in outcome.artifacts if item.type == "text_extract"]
+        present = bool(extracts)
+        record(
+            "required_text_extract",
+            present,
+            "text_extract exists" if present else "text_extract was requested but not produced",
+            RunStatus.PARTIAL,
+            "text_extract",
+        )
+        if present:
+            nonempty = any(item.bytes > 0 for item in extracts)
+            record(
+                "text_extract_nonempty",
+                nonempty,
+                "text_extract is nonempty" if nonempty else "text_extract is empty",
+                RunStatus.PARTIAL,
+                "text_extract",
+            )
+            visited = _visited_urls(outcome)
+            for item in extracts:
+                source = item.source_url or ""
+                page_ok = bool(source) and any(urls_equivalent(source, seen) for seen in visited)
+                record(
+                    "text_extract_source",
+                    page_ok,
+                    (
+                        "text_extract source_url matches a visited page"
+                        if page_ok
+                        else "text_extract source_url does not match a visited page"
+                    ),
+                    RunStatus.FAILED,
+                    "text_extract",
+                )
+
+    if "answer" in requested_types or needs_answer(spec.raw):
+        answers = [item for item in outcome.artifacts if item.type == "answer"]
+        extracts = [item for item in outcome.artifacts if item.type == "text_extract"]
+        present = bool(answers)
+        record(
+            "required_answer",
+            present,
+            "answer exists" if present else "answer was requested but not produced",
+            RunStatus.PARTIAL,
+            "answer",
+        )
+        if present:
+            nonempty = any(item.bytes > 0 for item in answers)
+            record(
+                "answer_nonempty",
+                nonempty,
+                "answer is nonempty" if nonempty else "answer is empty",
+                RunStatus.PARTIAL,
+                "answer",
+            )
+            extract_hashes = {item.sha256 for item in extracts if item.sha256}
+            cited = str((outcome.metadata or {}).get("answer_extract_sha256") or "") in extract_hashes
+            if not cited:
+                for field in fields:
+                    if not str(field.get("path") or "").startswith("answer"):
+                        continue
+                    refs = " ".join(str(item) for item in (field.get("evidence_refs") or []))
+                    if any(hash_ and hash_ in refs for hash_ in extract_hashes):
+                        cited = True
+            if not cited and extracts and answers:
+                cited = bool(extracts[-1].source_url) and extracts[-1].source_url == answers[-1].source_url
+            record(
+                "answer_from_extract",
+                cited,
+                "answer is derived from a captured extract" if cited else "answer has no captured extract",
+                RunStatus.FAILED,
+                "answer",
+            )
+            if extracts and answers:
+                extract_len = _artifact_text_length(extracts[-1])
+                answer_len = _artifact_text_length(answers[-1])
+                distinct = extract_len > 0 and answer_len != extract_len
+                record(
+                    "answer_not_raw_extract",
+                    distinct,
+                    "answer is not the raw extract re-stored"
+                    if distinct
+                    else "answer is the same length as the extract; no answering happened",
+                    RunStatus.PARTIAL,
+                    "answer",
+                )
 
     if "download" in requested_types:
         artifact = artifacts.get("download")
@@ -324,6 +418,16 @@ def _check_screenshot(spec: TaskSpec, outcome: ExecutionOutcome, artifact: Optio
         RunStatus.PARTIAL,
         "screenshot",
     )
+
+
+def _artifact_text_length(artifact: Artifact) -> int:
+    path = Path(artifact.path) if artifact.path else None
+    if path is not None and path.is_file():
+        try:
+            return len(path.read_text(encoding="utf-8"))
+        except Exception:
+            return artifact.bytes
+    return artifact.bytes
 
 
 def _visited_urls(outcome: ExecutionOutcome) -> List[str]:

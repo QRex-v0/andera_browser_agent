@@ -8,6 +8,33 @@ from andera.models import ExecutionOutcome, TaskSpec
 def build_provenance(spec: TaskSpec, outcome: ExecutionOutcome) -> Dict[str, Any]:
     refs = [f"sha256:{item.sha256}" for item in outcome.artifacts if item.sha256]
     fields: List[Dict[str, Any]] = []
+    extracts = [item for item in outcome.artifacts if item.type == "text_extract"]
+    extract_refs = [f"sha256:{item.sha256}" for item in extracts if item.sha256]
+    for index, artifact in enumerate(extracts):
+        fields.append(
+            {
+                "path": f"text_extract[{index}]",
+                "value": artifact.description or "text_extract",
+                "evidence_refs": [f"sha256:{artifact.sha256}"] if artifact.sha256 else [],
+                "source_url": artifact.source_url or outcome.target_url,
+                "captured_at": artifact.captured_at or outcome.finished_at,
+                "trajectory_step": artifact.trajectory_step,
+                "source_locator": {"kind": "text_extract", "index": index, "path": artifact.path},
+            }
+        )
+    answers = [item for item in outcome.artifacts if item.type == "answer"]
+    for index, artifact in enumerate(answers):
+        fields.append(
+            {
+                "path": f"answer[{index}]",
+                "value": artifact.description or "answer",
+                "evidence_refs": extract_refs or ([f"sha256:{artifact.sha256}"] if artifact.sha256 else []),
+                "source_url": artifact.source_url or outcome.target_url,
+                "captured_at": artifact.captured_at or outcome.finished_at,
+                "trajectory_step": artifact.trajectory_step,
+                "source_locator": {"kind": "answer", "index": index, "path": artifact.path},
+            }
+        )
     shots = [item for item in outcome.artifacts if item.type == "screenshot"]
     for index, artifact in enumerate(shots):
         fields.append(

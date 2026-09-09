@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from andera.html_query import parse_html, query, table_to_rows
+from andera.html_query import node_visible_text, parse_html, query, table_to_rows
 from andera.models import Artifact, TrajectoryEvent, _to_plain, utc_now
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 MIME_BY_SUFFIX = {
     ".csv": "text/csv",
+    ".txt": "text/plain",
     ".html": "text/html",
     ".htm": "text/html",
     ".json": "application/json",
@@ -91,6 +93,31 @@ def sha256_hex(data: bytes) -> str:
 
 def sha256_file(path: Path) -> str:
     return sha256_hex(path.read_bytes())
+
+
+_SIMPLE_TAG = re.compile(r"^[a-z][\w-]*$")
+
+
+def extract_visible_text(html: str, selector: str = "") -> Tuple[str, str]:
+    if not html:
+        return "", selector
+    root = parse_html(html)
+    parts = [part.strip() for part in (selector or "").split(",") if part.strip()]
+    if not parts or all(_SIMPLE_TAG.match(part) for part in parts):
+        for part in parts or ("article", "main", "body"):
+            text = _first_visible_text(query(root, part))
+            if text:
+                return text, part
+        return "", selector
+    return _first_visible_text(query(root, selector)), selector
+
+
+def _first_visible_text(nodes: List) -> str:
+    for node in nodes:
+        text = node_visible_text(node)
+        if text:
+            return text
+    return ""
 
 
 def extract_table(html: str, selector: str) -> List[Dict[str, str]]:
