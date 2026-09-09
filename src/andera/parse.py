@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from andera.models import TaskSpec
 from andera.paths import fixture_path, repo_root
-from andera.schema import infer_required_columns, infer_row_limit
+from andera.schema import infer_required_columns, infer_row_limit, infer_screenshot_scope, needs_screenshot
 
 DEFAULT_SELECTOR = 'table[data-evidence="access-list"]'
 DEFAULT_TIMEOUT_MS = 8000
@@ -63,6 +63,7 @@ def parse_task(message: str, target_url: str | None = None, timeout_ms: int | No
         step_budget=max(20, 8 + 2 * row_limit),
         write_actions_allowed=False,
         row_limit=row_limit,
+        screenshot_scope=infer_screenshot_scope(text) if "screenshot" in artifacts else "full_page",
     )
 
 
@@ -80,7 +81,7 @@ def _infer_artifacts(text: str) -> list[str]:
         artifacts.append("csv")
     if "download" in lowered:
         artifacts.append("download")
-    if "screenshot" in lowered or "screen shot" in lowered:
+    if needs_screenshot(text):
         artifacts.append("screenshot")
     if "html" in lowered or "snapshot" in lowered:
         artifacts.append("html_snapshot")

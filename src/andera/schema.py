@@ -67,6 +67,44 @@ def infer_status_filters(text: str) -> List[str]:
     return [token for token in STATUS_FILTERS if re.search(rf"\b{token}\b", source)]
 
 
+_SCREENSHOT_EXPLICIT = (
+    r"\bscreenshots?\b",
+    r"\bscreen[\s_-]*shots?\b",
+)
+_SCREENSHOT_IMPLICIT = (
+    r"\bcapture (?:the |this |a )?(?:page|site|screen|viewport)\b",
+    r"\b(?:take|save) (?:a |the )?(?:picture|photo|image)\b",
+    r"\bvisual (?:record|evidence|proof|capture)\b",
+    r"\b(?:show|prove|confirm) (?:that )?(?:the )?(?:site|page|service) (?:is )?(?:still )?(?:live|up|online)\b",
+    r"\bstill (?:live|up|online)\b",
+    r"\bis still (?:live|up|online)\b",
+    r"\bshow (?:the |this )?(?:site|page)\b",
+    r"\b(?:image|picture|photo) of (?:the )?(?:page|site)\b",
+    r"\bfull[\s-]page (?:shot|capture|image)\b",
+)
+_VIEWPORT_SCOPE = r"\b(?:viewport|visible area|above the fold|current (?:view|screen|viewport))\b"
+_FULL_PAGE_SCOPE = r"\b(?:full[\s-]page|entire page|whole page)\b"
+_EXTENDS_PAST_SCREEN = r"\b(?:csv|spreadsheet|table|list|stories|items|results|rows)\b"
+
+
+def needs_screenshot(text: str) -> bool:
+    source = (text or "").lower()
+    return any(re.search(pattern, source) for pattern in _SCREENSHOT_EXPLICIT + _SCREENSHOT_IMPLICIT)
+
+
+def infer_screenshot_scope(text: str) -> str:
+    source = (text or "").lower()
+    if re.search(_VIEWPORT_SCOPE, source):
+        return "viewport"
+    if re.search(_FULL_PAGE_SCOPE, source):
+        return "full_page"
+    if infer_row_limit(text) > 0 or re.search(_EXTENDS_PAST_SCREEN, source):
+        return "full_page"
+    if re.search(r"\b(?:page|site)\b", source):
+        return "full_page"
+    return "full_page"
+
+
 def infer_row_limit(text: str) -> int:
     match = ROW_LIMIT_RE.search(text or "")
     if not match:

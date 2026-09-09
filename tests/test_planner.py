@@ -35,6 +35,8 @@ def _plan_payload(url: str = "") -> str:
             "step_budget": 12,
             "timeout_ms": 8000,
             "write_actions_allowed": False,
+            "row_limit": 0,
+            "screenshot_scope": "full_page",
         }
     )
 
@@ -48,6 +50,9 @@ def _action(action_type: str, **kwargs: Any) -> str:
         "timeout_ms": kwargs.get("timeout_ms", 0),
         "reason": "",
         "need_screenshot": False,
+        "full_page": True,
+        "match_text": "",
+        "match_date": "",
     }
     return json.dumps(payload)
 
@@ -109,3 +114,31 @@ def test_openai_planner_is_mocked_and_does_not_need_portal_wording(out_dir) -> N
         dumped = json.dumps(call)
         assert "OPENAI_API_KEY" not in dumped
         assert "Bearer " not in dumped
+
+
+def test_openai_planner_adds_screenshot_for_implicit_visual_record(tmp_path) -> None:
+    target = fixture_path("portals", "access-review.html").resolve().as_uri()
+    omitted = ScriptedClient([_plan_payload(url=target)])
+    implied = OpenAIPlanner(client=omitted, model="test-model").plan(
+        "Show the site is still live and capture the page",
+        target_url=target,
+    )
+    assert "screenshot" in implied.artifact_types
+    assert implied.screenshot_scope == "full_page"
+    assert "screenshot" in implied.evidence_requirements
+
+    extra = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    **json.loads(_plan_payload(url=target)),
+                    "artifact_types": ["csv", "html_snapshot", "screenshot"],
+                }
+            )
+        ]
+    )
+    stripped = OpenAIPlanner(client=extra, model="test-model").plan(
+        "Export the visible employee entitlement table as CSV.",
+        target_url=target,
+    )
+    assert "screenshot" not in stripped.artifact_types

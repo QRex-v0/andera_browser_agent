@@ -49,6 +49,7 @@ def test_requested_screenshot_is_not_silently_dropped(agent: EvidenceAgent) -> N
     assert any(issue.code == "incomplete_evidence" for issue in result.errors)
     assert any(item.type == "csv" for item in result.artifacts)
     assert all(item.type != "screenshot" for item in result.artifacts)
+    assert "screenshot" in result.verifier.get("unmet_requirements", [])
     assert result.status != RunStatus.SUCCESS
 
 

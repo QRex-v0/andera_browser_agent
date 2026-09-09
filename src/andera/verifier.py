@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from andera.evidence import inspect_png, png_scope_plausible
 from andera.models import (
     Artifact,
     ExecutionOutcome,
@@ -20,16 +22,29 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
     """Independent checks. May downgrade a status, never upgrade it."""
     checks: List[VerifierCheck] = []
     issues: List[Issue] = []
+    unmet_requirements: List[str] = []
     status = outcome.provisional_status
     provenance = provenance or {}
     fields = list(provenance.get("fields") or [])
 
-    def record(code: str, passed: bool, message: str, downgrade_to: Optional[RunStatus] = None) -> None:
+    def note_unmet(name: str) -> None:
+        if name and name not in unmet_requirements:
+            unmet_requirements.append(name)
+
+    def record(
+        code: str,
+        passed: bool,
+        message: str,
+        downgrade_to: Optional[RunStatus] = None,
+        requirement: str = "",
+    ) -> None:
         nonlocal status
         checks.append(VerifierCheck(code=code, passed=passed, message=message))
         if passed:
             return
         issues.append(Issue(code=code, message=message, retryable=False))
+        if requirement:
+            note_unmet(requirement)
         if downgrade_to is not None:
             status = worse_status(status, downgrade_to)
 
@@ -44,6 +59,7 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
             ok,
             "HTML snapshot exists and is nonempty" if ok else "HTML snapshot missing or empty",
             RunStatus.PARTIAL,
+            "html_snapshot",
         )
 
     if "csv" in requested_types:
@@ -54,6 +70,7 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
             present,
             "CSV artifact exists" if present else "CSV artifact was requested but not produced",
             RunStatus.PARTIAL,
+            "csv",
         )
         if spec.expect_rows:
             has_rows = bool(outcome.rows)
@@ -115,14 +132,7 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
                     )
 
     if "screenshot" in requested_types:
-        artifact = artifacts.get("screenshot")
-        ok = artifact is not None and artifact.bytes > 0
-        record(
-            "required_screenshot",
-            ok,
-            "Screenshot exists and is nonempty" if ok else "Screenshot was requested but not captured",
-            RunStatus.PARTIAL,
-        )
+        _check_screenshot(spec, outcome, artifacts.get("screenshot"), record)
 
     if "download" in requested_types:
         artifact = artifacts.get("download")
@@ -132,6 +142,7 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
             present,
             "Download exists" if present else "Download was requested but no file was captured",
             RunStatus.PARTIAL,
+            "download",
         )
         if present:
             nonempty = artifact.bytes > 0
@@ -211,7 +222,69 @@ def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict]
         )
 
     unmet = [check.message for check in checks if not check.passed]
-    return VerifierReport(status=status, checks=checks, unmet=unmet, issues=issues)
+    return VerifierReport(
+        status=status,
+        checks=checks,
+        unmet=unmet,
+        unmet_requirements=unmet_requirements,
+        issues=issues,
+    )
+
+
+def _check_screenshot(spec: TaskSpec, outcome: ExecutionOutcome, artifact: Optional[Artifact], record) -> None:
+    scope = spec.screenshot_scope if spec.screenshot_scope in {"viewport", "full_page"} else "full_page"
+    if artifact is None:
+        record(
+            "required_screenshot",
+            False,
+            "Screenshot was requested but not captured",
+            RunStatus.PARTIAL,
+            "screenshot",
+        )
+        return
+    path = Path(artifact.path) if artifact.path else None
+    if path is None or not path.is_file():
+        record(
+            "required_screenshot",
+            False,
+            "Screenshot file is missing",
+            RunStatus.PARTIAL,
+            "screenshot",
+        )
+        return
+    data = path.read_bytes()
+    if not data:
+        record(
+            "required_screenshot",
+            False,
+            "Screenshot file is empty",
+            RunStatus.PARTIAL,
+            "screenshot",
+        )
+        return
+    ok, dims, reason = inspect_png(data)
+    record(
+        "required_screenshot",
+        ok,
+        "Screenshot exists and is a nonempty PNG" if ok else reason,
+        RunStatus.PARTIAL,
+        "screenshot",
+    )
+    if not ok or dims is None:
+        return
+    metrics = {}
+    if isinstance(outcome.metadata, dict):
+        recorded = outcome.metadata.get("screenshot_metrics")
+        if isinstance(recorded, dict):
+            metrics = recorded
+    dim_ok, dim_msg = png_scope_plausible(dims[0], dims[1], scope, outcome.environment, metrics)
+    record(
+        "screenshot_dimensions",
+        dim_ok,
+        dim_msg,
+        RunStatus.PARTIAL,
+        "screenshot",
+    )
 
 
 def _visited_urls(outcome: ExecutionOutcome) -> List[str]:

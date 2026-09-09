@@ -80,6 +80,7 @@ def execute(
         "planner": getattr(planner, "name", type(planner).__name__),
         "row_limit": spec.row_limit,
         "required_columns": list(spec.required_columns),
+        "screenshot_scope": spec.screenshot_scope,
     }
 
     def remaining_ms() -> int:
@@ -166,6 +167,7 @@ def execute(
                 extract_step=extract_step,
                 remaining_ms=remaining_ms(),
                 risk=risk,
+                metadata=metadata,
             )
         except FileNotFoundError as exc:
             record(action.type, action.args, "error", html, risk)
@@ -215,6 +217,27 @@ def execute(
     if html and not any(item.type == "html_snapshot" for item in artifacts):
         _maybe_write_html(store, artifacts, html, spec, trajectory[-1].step if trajectory else 0)
 
+    if (
+        "screenshot" in requested_types
+        and not any(item.type == "screenshot" for item in artifacts)
+        and not any(event.action == "screenshot" for event in trajectory)
+        and status not in {RunStatus.FAILED, RunStatus.BLOCKED}
+    ):
+        html = html or _safe_content(browser)
+        status, screenshot_note = _capture_screenshot(
+            browser=browser,
+            spec=spec,
+            store=store,
+            artifacts=artifacts,
+            errors=errors,
+            warnings=warnings,
+            record=record,
+            status=status,
+            html=html,
+            risk=ActionRisk.READ.value,
+            metadata=metadata,
+        )
+
     if status == RunStatus.SUCCESS and not artifacts:
         status = RunStatus.PARTIAL
         errors.append(Issue("incomplete_evidence", "No evidence artifacts were captured", retryable=False))
@@ -260,6 +283,7 @@ def _apply_action(
     extract_step: int,
     remaining_ms: int,
     risk: str,
+    metadata: Dict[str, Any],
 ) -> tuple:
     args = dict(action.args)
     selector = str(args.get("selector") or spec.required_selector or "table")
@@ -313,32 +337,21 @@ def _apply_action(
 
     if action.type == "screenshot":
         html = _ensure_page(browser, spec, record, risk)
-        screenshot_path = store.evidence_dir / "screenshot-final.png"
-        try:
-            screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-            browser.screenshot(str(screenshot_path))
-            event = record("screenshot", {"path": str(screenshot_path)}, "ok", html, risk)
-            artifacts.append(
-                store.artifact_from_path(
-                    "screenshot",
-                    screenshot_path,
-                    "Full-page screenshot",
-                    source_url=browser.current_url() or spec.target_url,
-                    trajectory_step=event.step,
-                )
-            )
-        except NotImplementedError as exc:
-            warnings.append(Issue("screenshot_unavailable", str(exc), retryable=False))
-            record("screenshot", {"path": str(screenshot_path)}, "unavailable", html, risk)
-            status = worse_status(status, RunStatus.PARTIAL)
-            errors.append(
-                Issue(
-                    "incomplete_evidence",
-                    "Screenshot was requested but this browser backend cannot capture pixels",
-                    retryable=False,
-                )
-            )
-        return status, html, rows, columns, extract_step, "screenshot_captured"
+        status, screenshot_note = _capture_screenshot(
+            browser=browser,
+            spec=spec,
+            store=store,
+            artifacts=artifacts,
+            errors=errors,
+            warnings=warnings,
+            record=record,
+            status=status,
+            html=html,
+            risk=risk,
+            metadata=metadata,
+            full_page=args.get("full_page"),
+        )
+        return status, html, rows, columns, extract_step, screenshot_note
 
     if action.type == "download":
         html = _ensure_page(browser, spec, record, risk)
@@ -388,29 +401,19 @@ def _apply_action(
             "screenshot" in {str(item).lower() for item in spec.artifact_types}
             and not any(item.type == "screenshot" for item in artifacts)
         ):
-            screenshot_path = store.evidence_dir / "screenshot-final.png"
-            try:
-                browser.screenshot(str(screenshot_path))
-            except NotImplementedError as exc:
-                warnings.append(Issue("screenshot_unavailable", str(exc), retryable=False))
-                status = worse_status(status, RunStatus.PARTIAL)
-            else:
-                screenshot_event = record(
-                    "screenshot",
-                    {"path": str(screenshot_path)},
-                    "ok",
-                    html,
-                    risk,
-                )
-                artifacts.append(
-                    store.artifact_from_path(
-                        "screenshot",
-                        screenshot_path,
-                        "Full-page screenshot",
-                        source_url=browser.current_url() or spec.target_url,
-                        trajectory_step=screenshot_event.step,
-                    )
-                )
+            status, _ = _capture_screenshot(
+                browser=browser,
+                spec=spec,
+                store=store,
+                artifacts=artifacts,
+                errors=errors,
+                warnings=warnings,
+                record=record,
+                status=status,
+                html=html,
+                risk=risk,
+                metadata=metadata,
+            )
         return status, html, rows, columns, extract_step, "downloaded_and_snapshot"
 
     if action.type == "click":
@@ -464,6 +467,93 @@ def _apply_action(
 
     record(action.type, args, "ignored", html, risk)
     return status, html, rows, columns, extract_step, screenshot_note
+
+
+def _capture_screenshot(
+    *,
+    browser: Any,
+    spec: TaskSpec,
+    store: EvidenceStore,
+    artifacts: List[Artifact],
+    errors: List[Issue],
+    warnings: List[Issue],
+    record,
+    status: RunStatus,
+    html: str,
+    risk: str,
+    metadata: Dict[str, Any],
+    full_page: Any = None,
+) -> tuple[RunStatus, str]:
+    if any(item.type == "screenshot" for item in artifacts):
+        return status, "screenshot_captured"
+    use_full_page = spec.screenshot_scope != "viewport" if full_page is None else bool(full_page)
+    screenshot_path = store.evidence_dir / "screenshot-final.png"
+    metrics = _page_metrics(browser)
+    metadata["screenshot_scope"] = spec.screenshot_scope
+    metadata["screenshot_metrics"] = metrics
+    try:
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        browser.screenshot(str(screenshot_path), full_page=use_full_page)
+        event = record(
+            "screenshot",
+            {
+                "path": str(screenshot_path),
+                "full_page": use_full_page,
+                "scope": spec.screenshot_scope,
+                **metrics,
+            },
+            "ok",
+            html,
+            risk,
+        )
+        artifacts.append(
+            store.artifact_from_path(
+                "screenshot",
+                screenshot_path,
+                "Full-page screenshot" if use_full_page else "Viewport screenshot",
+                source_url=browser.current_url() or spec.target_url,
+                trajectory_step=event.step,
+            )
+        )
+        return status, "screenshot_captured"
+    except NotImplementedError as exc:
+        warnings.append(Issue("screenshot_unavailable", str(exc), retryable=False))
+        record(
+            "screenshot",
+            {"path": str(screenshot_path), "full_page": use_full_page, "scope": spec.screenshot_scope},
+            "unavailable",
+            html,
+            risk,
+        )
+        status = worse_status(status, RunStatus.PARTIAL)
+        errors.append(
+            Issue(
+                "incomplete_evidence",
+                "Screenshot was requested but this browser backend cannot capture pixels",
+                retryable=False,
+            )
+        )
+        return status, "screenshot_unavailable"
+
+
+def _page_metrics(browser: Any) -> Dict[str, Any]:
+    getter = getattr(browser, "page_metrics", None)
+    if callable(getter):
+        try:
+            data = getter()
+            if isinstance(data, dict):
+                return dict(data)
+        except Exception:
+            pass
+    env = _environment(browser)
+    viewport = env.get("viewport") or {}
+    return {
+        "viewportWidth": int(viewport.get("width") or 1280),
+        "viewportHeight": int(viewport.get("height") or 720),
+        "scrollWidth": int(viewport.get("width") or 1280),
+        "scrollHeight": int(viewport.get("height") or 720),
+        "devicePixelRatio": 1,
+    }
 
 
 def _extract(

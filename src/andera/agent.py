@@ -79,6 +79,7 @@ class EvidenceAgent:
         metadata["row_count"] = len(outcome.rows)
         metadata["columns"] = list(outcome.columns)
         metadata["verifier_unmet"] = list(verified.unmet)
+        metadata["unmet_requirements"] = list(verified.unmet_requirements)
         metadata["machine_status"] = verified.status.value
 
         result = RunResult(
@@ -96,6 +97,7 @@ class EvidenceAgent:
             verifier={
                 "status": verified.status.value,
                 "unmet": verified.unmet,
+                "unmet_requirements": verified.unmet_requirements,
                 "checks": [
                     {"code": check.code, "passed": check.passed, "message": check.message}
                     for check in verified.checks

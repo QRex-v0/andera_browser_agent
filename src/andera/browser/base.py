@@ -13,7 +13,7 @@ class BrowserSession(Protocol):
     def content(self) -> str:
         """Return current page HTML."""
 
-    def screenshot(self, path: str) -> None:
+    def screenshot(self, path: str, full_page: bool = True) -> None:
         """Write a PNG screenshot to path, or raise if unsupported."""
 
     def download(

@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from andera.html_query import parse_html, query, table_to_rows
 from andera.models import Artifact, TrajectoryEvent, _to_plain, utc_now
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 MIME_BY_SUFFIX = {
     ".csv": "text/csv",
@@ -17,6 +19,70 @@ MIME_BY_SUFFIX = {
     ".png": "image/png",
     ".pdf": "application/pdf",
 }
+
+
+def inspect_png(data: bytes) -> Tuple[bool, Optional[Tuple[int, int]], str]:
+    """Return (ok, (width, height), reason). Checks magic bytes, not the extension."""
+    if not data:
+        return False, None, "Screenshot file is empty"
+    if len(data) < len(PNG_MAGIC) or not data.startswith(PNG_MAGIC):
+        if data.startswith(b"\x89PNG"):
+            return False, None, "Screenshot PNG is truncated"
+        return False, None, "Screenshot is not a valid PNG"
+    if len(data) < 24 or data[12:16] != b"IHDR":
+        return False, None, "Screenshot PNG is truncated"
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    if width <= 0 or height <= 0:
+        return False, None, "Screenshot PNG has invalid dimensions"
+    return True, (width, height), "Screenshot is a valid PNG"
+
+
+def png_scope_plausible(
+    width: int,
+    height: int,
+    scope: str,
+    environment: Optional[Dict[str, Any]] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str]:
+    viewport = ((environment or {}).get("viewport") or {}) if environment else {}
+    recorded = metrics or {}
+    vw = int(recorded.get("viewportWidth") or viewport.get("width") or 1280)
+    vh = int(recorded.get("viewportHeight") or viewport.get("height") or 720)
+    scroll_h = int(recorded.get("scrollHeight") or 0)
+    try:
+        dpr = float(recorded.get("devicePixelRatio") or 1)
+    except (TypeError, ValueError):
+        dpr = 1.0
+    if dpr <= 0:
+        dpr = 1.0
+    if width < 64 or height < 64:
+        return False, f"Screenshot dimensions {width}x{height} are too small for a page capture"
+    expected_w = max(int(round(vw * dpr)), 1)
+    if not _close(width, expected_w) and not _close(width, vw) and not _close(width, vw * 2):
+        return False, f"Screenshot width {width} is not plausible for viewport width {vw}"
+    if scope == "viewport":
+        expected_h = max(int(round(vh * dpr)), 1)
+        too_tall = height > max(expected_h, vh * 2) * 1.25
+        if too_tall:
+            return False, (
+                f"Viewport screenshot is {width}x{height}, taller than the {vw}x{vh} viewport"
+            )
+        if not (_close(height, expected_h) or _close(height, vh) or _close(height, vh * 2)):
+            return False, f"Viewport screenshot height {height} is not plausible for viewport {vh}"
+        return True, f"Screenshot dimensions {width}x{height} match viewport scope"
+    expected_h = max(vh, scroll_h) * dpr if scroll_h else 0
+    if expected_h and height + 8 < expected_h * 0.8:
+        return False, (
+            f"Full-page screenshot is {width}x{height}, shorter than page height {int(expected_h)}"
+        )
+    return True, f"Screenshot dimensions {width}x{height} are plausible for full_page scope"
+
+
+def _close(actual: int, expected: int, tolerance: float = 0.2) -> bool:
+    if expected <= 0:
+        return False
+    return abs(actual - expected) / expected <= tolerance
 
 
 def sha256_hex(data: bytes) -> str:

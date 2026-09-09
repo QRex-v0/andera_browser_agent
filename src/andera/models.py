@@ -48,6 +48,7 @@ class TaskSpec:
     step_budget: int = 20
     write_actions_allowed: bool = False
     row_limit: int = 0
+    screenshot_scope: str = "full_page"
 
 
 EvidenceTask = TaskSpec
@@ -104,6 +105,7 @@ class VerifierReport:
     status: RunStatus
     checks: List[VerifierCheck] = field(default_factory=list)
     unmet: List[str] = field(default_factory=list)
+    unmet_requirements: List[str] = field(default_factory=list)
     issues: List[Issue] = field(default_factory=list)
 
 

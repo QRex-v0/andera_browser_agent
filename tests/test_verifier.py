@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from andera.models import Artifact, ExecutionOutcome, RunStatus, TaskSpec
 from andera.verifier import verify
 
@@ -79,6 +81,69 @@ def test_verifier_rejects_success_without_screenshot() -> None:
     )
     assert report.status == RunStatus.PARTIAL
     assert any(check.code == "required_screenshot" and not check.passed for check in report.checks)
+    assert "screenshot" in report.unmet_requirements
+
+
+def _png_bytes(width: int, height: int) -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + (13).to_bytes(4, "big")
+        + b"IHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+        + b"\x00\x00\x00\x00"
+    )
+
+
+def test_deleted_screenshot_before_verification_is_partial(tmp_path: Path) -> None:
+    path = tmp_path / "screenshot-final.png"
+    path.write_bytes(_png_bytes(1280, 2400))
+    spec = _spec(artifact_types=["html_snapshot", "screenshot"], screenshot_scope="full_page")
+    outcome = _outcome(
+        html="<html>ok</html>",
+        artifacts=[
+            Artifact(type="html_snapshot", path="page.html", description="", bytes=12, sha256="ab"),
+            Artifact(
+                type="screenshot",
+                path=str(path),
+                description="Full-page screenshot",
+                bytes=path.stat().st_size,
+                sha256="cd",
+            ),
+        ],
+        environment={"viewport": {"width": 1280, "height": 720}},
+    )
+    path.unlink()
+    report = verify(spec, outcome, provenance={"fields": []})
+    assert report.status == RunStatus.PARTIAL
+    assert report.status != RunStatus.SUCCESS
+    assert "screenshot" in report.unmet_requirements
+    assert any(check.code == "required_screenshot" and not check.passed for check in report.checks)
+
+
+def test_truncated_screenshot_is_partial(tmp_path: Path) -> None:
+    path = tmp_path / "screenshot-final.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a")
+    report = verify(
+        _spec(artifact_types=["screenshot"], screenshot_scope="full_page", expect_rows=False),
+        _outcome(
+            html="",
+            artifacts=[
+                Artifact(
+                    type="screenshot",
+                    path=str(path),
+                    description="Full-page screenshot",
+                    bytes=path.stat().st_size,
+                    sha256="cd",
+                )
+            ],
+            environment={"viewport": {"width": 1280, "height": 720}},
+        ),
+        provenance={"fields": []},
+    )
+    assert report.status == RunStatus.PARTIAL
+    assert "screenshot" in report.unmet_requirements
 
 
 def test_verifier_rejects_success_when_final_host_differs() -> None:

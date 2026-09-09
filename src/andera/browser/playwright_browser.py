@@ -67,8 +67,37 @@ class PlaywrightBrowser:
     def content(self) -> str:
         return self._page.content()
 
-    def screenshot(self, path: str) -> None:
-        self._page.screenshot(path=path, full_page=True)
+    def screenshot(self, path: str, full_page: bool = True) -> None:
+        self._page.screenshot(path=path, full_page=full_page)
+
+    def page_metrics(self) -> dict:
+        try:
+            return dict(
+                self._page.evaluate(
+                    """() => ({
+                        viewportWidth: window.innerWidth,
+                        viewportHeight: window.innerHeight,
+                        scrollWidth: Math.max(
+                            document.documentElement.scrollWidth,
+                            document.body ? document.body.scrollWidth : 0
+                        ),
+                        scrollHeight: Math.max(
+                            document.documentElement.scrollHeight,
+                            document.body ? document.body.scrollHeight : 0
+                        ),
+                        devicePixelRatio: window.devicePixelRatio || 1
+                    })"""
+                )
+                or {}
+            )
+        except Exception:
+            return {
+                "viewportWidth": self.VIEWPORT["width"],
+                "viewportHeight": self.VIEWPORT["height"],
+                "scrollWidth": self.VIEWPORT["width"],
+                "scrollHeight": self.VIEWPORT["height"],
+                "devicePixelRatio": 1,
+            }
 
     def click(self, selector: str) -> None:
         self._page.click(selector, timeout=5000)

@@ -44,10 +44,20 @@ class FixtureBrowser:
             raise RuntimeError("No page loaded")
         return self._html
 
-    def screenshot(self, path: str) -> None:
+    def screenshot(self, path: str, full_page: bool = True) -> None:
+        del path, full_page
         raise NotImplementedError(
             "FixtureBrowser cannot capture pixels. Use --browser playwright for screenshots."
         )
+
+    def page_metrics(self) -> dict:
+        return {
+            "viewportWidth": 1280,
+            "viewportHeight": 720,
+            "scrollWidth": 1280,
+            "scrollHeight": 720,
+            "devicePixelRatio": 1,
+        }
 
     def download(self, selector: str, destination_dir: str, match_text: str = "", match_date: str = "") -> str:
         raise NotImplementedError(

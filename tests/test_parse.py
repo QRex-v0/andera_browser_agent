@@ -20,7 +20,20 @@ def test_parse_timeout_and_screenshot() -> None:
         "Take a screenshot of the access review portal with a timeout of 2 seconds"
     )
     assert "screenshot" in task.artifact_types
+    assert task.screenshot_scope == "full_page"
     assert task.timeout_ms == 2000
+
+
+def test_parse_implicit_visual_record_requires_screenshot() -> None:
+    live = parse_task("Show the site is still live on the access review portal")
+    assert "screenshot" in live.artifact_types
+    assert live.screenshot_scope == "full_page"
+    captured = parse_task("Capture the page of the access review portal")
+    assert "screenshot" in captured.artifact_types
+    viewport = parse_task("Take a viewport screenshot of the access review portal")
+    assert viewport.screenshot_scope == "viewport"
+    full = parse_task("Take a full page screenshot of the access review portal")
+    assert full.screenshot_scope == "full_page"
 
 
 def test_parse_class_selector() -> None:

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Protocol, Sequence
 from andera.env import openai_api_key, openai_model
 from andera.models import BrowserAction, TaskSpec, TrajectoryEvent
 from andera.parse import parse_task
+from andera.schema import infer_screenshot_scope, needs_screenshot
 
 ALLOWED_ACTIONS = (
     "navigate",
@@ -42,11 +43,13 @@ If last/first/newest refers to an event time, the rendered list order is not tha
 Set timeout_ms to at least 300000 for live public websites.
 Never include secrets or API keys.
 Prefer generic evidence requirements such as a visible data table, CSV, HTML snapshot, or screenshot.
+If the request implies a visual record — explicitly ("take a screenshot") or implicitly ("show the site is still live", "capture the page") — include "screenshot" in artifact_types and set screenshot_scope to "viewport" or "full_page".
+Use full_page when the request says "full page" or the target content plausibly extends past one screen (lists, tables, long pages). Use viewport only when the operator asks for the visible viewport. Truncated page captures are incomplete evidence.
 """
 
 DECIDE_INSTRUCTIONS = """You are the executor planner for a read-only audit evidence browser agent.
 Given the TaskSpec, compact DOM/accessibility observation, and prior actions, choose the next typed browser action.
-Prefer accessibility/DOM observations. Request a screenshot only if the page is visual, ambiguous, or not table-like.
+Prefer accessibility/DOM observations. If artifact_types includes screenshot, emit a screenshot action that honors screenshot_scope before done_subgoal. Request an extra screenshot only if the page is visual, ambiguous, or not table-like.
 Use generic locators (table, role, accessible name). Do not use site-specific hardcoded selectors.
 Read-only: do not submit, approve, purchase, delete, or type into password fields.
 If list_candidates is nonempty, do not wait for a table; emit extract_table or extract_list.
@@ -121,7 +124,7 @@ class RulePlanner:
         if "csv" in spec.artifact_types and not extracted:
             return BrowserAction("extract_table", {"selector": selector})
         if "screenshot" in spec.artifact_types and "screenshot" not in done:
-            return BrowserAction("screenshot", {})
+            return BrowserAction("screenshot", {"full_page": spec.screenshot_scope != "viewport"})
         return BrowserAction("done_subgoal", {})
 
 
@@ -150,8 +153,10 @@ class OpenAIPlanner:
             _plan_schema(),
         )
         artifacts = _normalize_artifact_types(_string_list(payload.get("artifact_types")) or ["csv", "html_snapshot"])
-        lowered = message.lower()
-        if "screenshot" in artifacts and "screenshot" not in lowered and "screen shot" not in lowered:
+        if needs_screenshot(message):
+            if "screenshot" not in artifacts:
+                artifacts.append("screenshot")
+        elif "screenshot" in artifacts:
             artifacts = [item for item in artifacts if item != "screenshot"]
         if "html_snapshot" not in artifacts:
             artifacts.append("html_snapshot")
@@ -166,6 +171,9 @@ class OpenAIPlanner:
             for name in (_string_list(payload.get("required_columns")) or infer_required_columns(message))
         ]
         row_limit = int(payload.get("row_limit") or 0) or infer_row_limit(message)
+        scope = str(payload.get("screenshot_scope") or "").strip().lower().replace("-", "_")
+        if scope not in {"viewport", "full_page"}:
+            scope = infer_screenshot_scope(message)
         if timeout_ms is not None:
             resolved_timeout = int(timeout_ms)
         else:
@@ -180,12 +188,16 @@ class OpenAIPlanner:
             timeout_ms=resolved_timeout,
             expect_rows=bool(payload.get("expect_rows", "csv" in artifacts)),
             subgoals=_string_list(payload.get("subgoals")) or ["open_target", "observe_page", "collect_evidence"],
-            evidence_requirements=_string_list(payload.get("evidence_requirements")) or list(artifacts),
+            evidence_requirements=_with_screenshot_requirement(
+                _string_list(payload.get("evidence_requirements")) or list(artifacts),
+                artifacts,
+            ),
             required_columns=required_columns,
             completion_criteria=_string_list(payload.get("completion_criteria")),
             step_budget=max(int(payload.get("step_budget") or 24), 8 + 2 * row_limit),
             write_actions_allowed=bool(payload.get("write_actions_allowed", False)),
             row_limit=row_limit,
+            screenshot_scope=scope,
         )
 
     def decide(
@@ -208,6 +220,7 @@ class OpenAIPlanner:
                     "required_columns": spec.required_columns,
                     "row_limit": spec.row_limit,
                     "write_actions_allowed": spec.write_actions_allowed,
+                    "screenshot_scope": spec.screenshot_scope,
                 },
                 "observation": observation,
                 "screenshot": screenshot_note,
@@ -235,6 +248,11 @@ class OpenAIPlanner:
             )
             if payload.get(key) not in (None, "", False)
         }
+        if action_type == "screenshot":
+            if "full_page" in payload and payload.get("full_page") is not None:
+                args["full_page"] = bool(payload.get("full_page"))
+            else:
+                args["full_page"] = spec.screenshot_scope != "viewport"
         if action_type == "navigate" and "url" not in args:
             args["url"] = spec.target_url
         if action_type in {"wait", "extract_table", "click", "type", "select"} and "selector" not in args:
@@ -318,6 +336,13 @@ def _string_list(value: Any) -> List[str]:
     return [str(value)]
 
 
+def _with_screenshot_requirement(requirements: List[str], artifacts: List[str]) -> List[str]:
+    result = list(requirements)
+    if "screenshot" in artifacts and "screenshot" not in result:
+        result.append("screenshot")
+    return result
+
+
 def _normalize_artifact_types(values: List[str]) -> List[str]:
     aliases = {
         "html": "html_snapshot",
@@ -383,6 +408,7 @@ def _plan_schema() -> Dict[str, Any]:
                 "timeout_ms": {"type": "integer"},
                 "write_actions_allowed": {"type": "boolean"},
                 "row_limit": {"type": "integer"},
+                "screenshot_scope": {"type": "string", "enum": ["viewport", "full_page"]},
             },
             "required": [
                 "intent",
@@ -398,6 +424,7 @@ def _plan_schema() -> Dict[str, Any]:
                 "timeout_ms",
                 "write_actions_allowed",
                 "row_limit",
+                "screenshot_scope",
             ],
         },
     }
@@ -419,6 +446,7 @@ def _action_schema() -> Dict[str, Any]:
                 "timeout_ms": {"type": "integer"},
                 "reason": {"type": "string"},
                 "need_screenshot": {"type": "boolean"},
+                "full_page": {"type": "boolean"},
             },
             "required": [
                 "type",
@@ -430,6 +458,7 @@ def _action_schema() -> Dict[str, Any]:
                 "timeout_ms",
                 "reason",
                 "need_screenshot",
+                "full_page",
             ],
         },
     }
