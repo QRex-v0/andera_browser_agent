@@ -387,7 +387,7 @@ For changing websites, measure process and schema consistency within a recorded 
 ### Workflow
 
 - `main` receives changes only through reviewed, passing PRs.
-- Cursor checkpoints every 30–40 minutes with a commit or draft PR.
+- Cursor checkpoints every 30–40 minutes with a commit or draft PR. Latest Cursor checkpoint: PR #4 plus §10 below.
 - Codex reviews each checkpoint and returns signed, line-specific feedback.
 - Cursor and Codex do not edit the same files concurrently.
 - Every Codex GitHub comment begins with `[CODEX-GPT-5]`.
@@ -395,9 +395,58 @@ For changing websites, measure process and schema consistency within a recorded 
 
 ## 9. Immediate execution order
 
-1. Cursor opens the current vertical-slice PR.
-2. Codex reviews it and establishes the baseline eval score.
+1. Cursor opens the current vertical-slice PR. **Done:** https://github.com/QRex-v0/andera_browser_agent/pull/4
+2. Codex reviews it and establishes the baseline eval score. **In progress:** Codex requested P1/P2 correctness fixes before merge (see §10).
 3. Add supplied test cases to the eval matrix.
 4. Cursor implements the generic Playwright action loop.
 5. Codex implements or reviews verification and regression coverage.
 6. Iterate on visible failures until the release checkpoint.
+
+## 10. Current slice status — Cursor
+
+[CURSOR-Grok-4.6] 2026-09-09
+
+This is the on-disk baseline Codex should review against. It is the smallest working evidence-collection loop, not the architecture in §§3–4.
+
+### Shipped
+
+- Branch: `cursor/mvp-vertical-slice` (`f518a12` plus this plan merge)
+- PR: https://github.com/QRex-v0/andera_browser_agent/pull/4
+- Package: `andera` (Python 3.9, no required runtime deps)
+- CLI: `python -m andera run "<natural-language task>"`
+- Fixture workflow: collect a user access list from `fixtures/portals/access-review.html`
+- Artifacts: `access_list.csv`, `page.html`, `result.json`
+- Browser port: `FixtureBrowser` (default) and optional `PlaywrightBrowser`
+- Statuses today: `success`, `incomplete`, `timeout`, `failed`
+
+### Tests run
+
+```text
+python -m pip install -e ".[dev]"
+python -m pytest -v
+```
+
+Result: **9 passed in 0.10s** (Python 3.9.6).
+
+Covered paths: access-list success, empty table → `incomplete`, missing table → `timeout`, missing file → `failed`, requested screenshot on fixture backend → `incomplete`.
+
+### Gaps vs this plan
+
+| Plan requirement | Current slice |
+|---|---|
+| Canonical statuses `partial` / `blocked` | Uses `incomplete`; no `blocked` |
+| Typed `TaskSpec` planner | Keyword parser in `src/andera/parse.py` |
+| Playwright action loop | Adapter exists; default tests use fixtures only |
+| Independent verifier + SHA-256 provenance | `result.json` metadata only |
+| Trajectory, `report.html`, field-level provenance | Not implemented |
+| Generic, non-portal routing | `PORTAL_FIXTURES` and `DEFAULT_SELECTOR` are known generalization debt |
+
+### Open review items on PR #4
+
+Codex `[CODEX-GPT-5]` requested before merge:
+
+1. Preserve HTML text order in nested table cells (`html_query.py`).
+2. Write an accurate `result.json` artifact byte size (currently `0`).
+3. Align parser class selectors with the fixture query engine.
+
+Playwright remains an explicit known limitation for this PR.

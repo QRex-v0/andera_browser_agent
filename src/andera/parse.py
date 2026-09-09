@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Dict
+from urllib.parse import urlparse
+
+from andera.models import EvidenceTask
+from andera.paths import fixture_path, repo_root
+
+DEFAULT_SELECTOR = 'table[data-evidence="access-list"]'
+DEFAULT_TIMEOUT_MS = 8000
+
+PORTAL_FIXTURES: Dict[str, Path] = {
+    "access review": fixture_path("portals", "access-review.html"),
+    "access review portal": fixture_path("portals", "access-review.html"),
+    "empty access": fixture_path("portals", "empty-access.html"),
+    "empty access portal": fixture_path("portals", "empty-access.html"),
+    "missing table": fixture_path("portals", "missing-table.html"),
+    "missing table portal": fixture_path("portals", "missing-table.html"),
+}
+
+
+def parse_task(message: str, target_url: str | None = None, timeout_ms: int | None = None) -> EvidenceTask:
+    text = message.strip()
+    if not text:
+        raise ValueError("Task message is empty")
+
+    url = target_url or _extract_url(text) or _infer_portal_url(text)
+    if not url:
+        raise ValueError(
+            "Could not determine a target. Name a known portal "
+            "(access review, empty access, missing table) or pass --url."
+        )
+
+    artifacts = _infer_artifacts(text)
+    selector = _extract_selector(text) or DEFAULT_SELECTOR
+    intent = _infer_intent(text)
+    return EvidenceTask(
+        raw=text,
+        intent=intent,
+        target_url=_normalize_target(url),
+        required_selector=selector,
+        artifact_types=artifacts,
+        timeout_ms=timeout_ms if timeout_ms is not None else _extract_timeout(text),
+        expect_rows=True,
+    )
+
+
+def _infer_intent(text: str) -> str:
+    lowered = text.lower()
+    if "access" in lowered or "entitlement" in lowered or "user list" in lowered:
+        return "collect_access_list"
+    return "collect_evidence"
+
+
+def _infer_artifacts(text: str) -> list[str]:
+    lowered = text.lower()
+    artifacts = []
+    if "csv" in lowered or "spreadsheet" in lowered or "access list" in lowered or "user" in lowered:
+        artifacts.append("csv")
+    if "screenshot" in lowered or "screen shot" in lowered:
+        artifacts.append("screenshot")
+    if "html" in lowered or "snapshot" in lowered:
+        artifacts.append("html_snapshot")
+    if not artifacts:
+        artifacts = ["csv", "html_snapshot"]
+    if "html_snapshot" not in artifacts:
+        artifacts.append("html_snapshot")
+    return artifacts
+
+
+def _extract_url(text: str) -> str | None:
+    match = re.search(r"(https?://\S+|file://\S+|fixture://\S+)", text)
+    return match.group(1).rstrip(").,") if match else None
+
+
+def _extract_selector(text: str) -> str | None:
+    match = re.search(
+        r"selector\s+((?:[a-zA-Z][\w-]*)?(?:[#.][\w-]+|\[[^\]]+\])+|[a-zA-Z][\w-]+)",
+        text,
+        re.I,
+    )
+    return match.group(1) if match else None
+
+
+def _extract_timeout(text: str) -> int:
+    match = re.search(r"timeout(?: of)?\s+(\d+)\s*(ms|s|seconds?)?", text, re.I)
+    if not match:
+        return DEFAULT_TIMEOUT_MS
+    value = int(match.group(1))
+    unit = (match.group(2) or "ms").lower()
+    if unit.startswith("s"):
+        return value * 1000
+    return value
+
+
+def _infer_portal_url(text: str) -> str | None:
+    lowered = text.lower()
+    for name, path in sorted(PORTAL_FIXTURES.items(), key=lambda item: -len(item[0])):
+        if name in lowered:
+            return path.resolve().as_uri()
+    return None
+
+
+def _normalize_target(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme in {"http", "https", "file", "fixture"}:
+        return url
+    path = Path(url)
+    if not path.is_absolute():
+        path = (repo_root() / path).resolve()
+    else:
+        path = path.resolve()
+    return path.as_uri()
