@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 import time
 from dataclasses import dataclass, field
@@ -58,6 +59,12 @@ class _Action:
     selector: str = ""
     label: str = ""
     evidence: str = ""
+
+
+@dataclass
+class _ActionOutcome:
+    ok: bool
+    detail: str = ""
 
 
 def collect_incremental_records(
@@ -131,9 +138,6 @@ def collect_incremental_records(
             accept_record,
         )
         duplicate_total += duplicates
-        if added:
-            no_progress = 0
-
         if requested > 0 and len(records_by_key) >= requested:
             return finish("target_count_reached", exhausted=False, rounds=rounds)
         if time.monotonic() >= deadline:
@@ -148,9 +152,26 @@ def collect_incremental_records(
         before = len(records_by_key)
         if action.shape == "next_link" and action.href:
             seen_next_hrefs.add(_canonical_url(action.href))
-        ok = _apply_action(browser, action)
-        if not ok:
-            return finish("source_exhausted", exhausted=True, rounds=rounds)
+        outcome = _apply_action(browser, action)
+        if not outcome.ok:
+            rounds += 1
+            shapes.append(action.shape)
+            steps.append(
+                PaginationStep(
+                    round=rounds,
+                    shape=action.shape,
+                    action=action.kind,
+                    before_count=before,
+                    after_count=before,
+                    new_count=0,
+                    duplicate_count=0,
+                    url=action.href or url,
+                    selector=action.selector,
+                    label=action.label,
+                    evidence=_join_evidence(action.evidence, f"action failed: {outcome.detail}"),
+                )
+            )
+            return finish("action_failed", exhausted=False, rounds=rounds)
         _settle(browser, settle_ms)
 
         after_html = _safe_content(browser)
@@ -271,7 +292,7 @@ def _find_load_more(root) -> Optional[_Action]:
         return _Action(
             shape="load_more",
             kind="click",
-            selector=_CONTROL_SELECTOR,
+            selector=_control_selector(node),
             label=label,
             evidence=f"control label {label!r}",
         )
@@ -288,8 +309,8 @@ def _find_next_link(root, page_url: str, seen_next_hrefs: set[str]) -> Optional[
             continue
         rel = node.attrs.get("rel", "").lower().split()
         label = _node_label(node)
-        class_name = node.attrs.get("class", "").lower()
-        if "next" in rel or _NEXT_RE.search(label) or "next" in class_name:
+        class_tokens = _class_tokens(node)
+        if "next" in rel or _NEXT_RE.search(label) or "next" in class_tokens:
             return _Action(
                 shape="next_link",
                 kind="goto",
@@ -346,9 +367,9 @@ def _current_page_number(page_url: str, anchors: Sequence[Any]) -> int:
         label = _node_label(node)
         if not re.fullmatch(r"\d{1,4}", label):
             continue
-        class_name = node.attrs.get("class", "").lower()
+        class_tokens = _class_tokens(node)
         aria_current = node.attrs.get("aria-current", "").lower()
-        if aria_current == "page" or "current" in class_name or "selected" in class_name:
+        if aria_current == "page" or "current" in class_tokens or "selected" in class_tokens:
             return int(label)
     return 0
 
@@ -366,29 +387,34 @@ def _next_evidence(node, label: str) -> str:
     return ", ".join(bits) or "next-page anchor"
 
 
-def _apply_action(browser: Any, action: _Action) -> bool:
+def _apply_action(browser: Any, action: _Action) -> _ActionOutcome:
     try:
         if action.kind == "goto" and action.href:
             browser.goto(action.href)
-            return True
+            return _ActionOutcome(True)
         if action.kind == "click":
             click = getattr(browser, "click", None)
             if not callable(click):
-                return False
-            click(action.selector or _CONTROL_SELECTOR, action.label)
-            return True
+                return _ActionOutcome(False, "browser has no click method")
+            selector = action.selector or _CONTROL_SELECTOR
+            if action.label and _accepts_match_text(click):
+                click(selector, action.label)
+            else:
+                click(selector)
+            return _ActionOutcome(True)
         if action.kind == "scroll":
             scroll = getattr(browser, "scroll", None)
             if callable(scroll):
                 scroll()
-                return True
+                return _ActionOutcome(True)
             scroll_to_end = getattr(browser, "scroll_to_end", None)
             if callable(scroll_to_end):
                 scroll_to_end()
-                return True
-    except Exception:
-        return False
-    return False
+                return _ActionOutcome(True)
+            return _ActionOutcome(False, "browser has no scroll method")
+    except Exception as exc:
+        return _ActionOutcome(False, f"{type(exc).__name__}: {exc}")
+    return _ActionOutcome(False, f"unsupported action kind {action.kind!r}")
 
 
 def _settle(browser: Any, settle_ms: int) -> None:
@@ -457,12 +483,71 @@ def _node_label(node) -> str:
 
 def _disabled(node) -> bool:
     attrs = getattr(node, "attrs", {}) or {}
-    class_name = attrs.get("class", "").lower()
     return (
         "disabled" in attrs
         or attrs.get("aria-disabled", "").lower() == "true"
-        or "disabled" in class_name.split()
+        or "disabled" in _class_tokens(node)
     )
+
+
+def _class_tokens(node) -> set[str]:
+    return set(_class_token_list(node))
+
+
+def _class_token_list(node) -> List[str]:
+    attrs = getattr(node, "attrs", {}) or {}
+    return [token for token in attrs.get("class", "").lower().split() if token]
+
+
+def _control_selector(node) -> str:
+    attrs = getattr(node, "attrs", {}) or {}
+    tag = getattr(node, "tag", "") or ""
+    element_id = attrs.get("id", "")
+    if element_id:
+        return _attr_selector(tag, "id", element_id)
+    for attr in ("data-testid", "data-test", "data-cy", "aria-label", "title", "value"):
+        value = attrs.get(attr, "")
+        if value:
+            return _attr_selector(tag, attr, value)
+    href = attrs.get("href", "")
+    if tag == "a" and href:
+        return _attr_selector("a", "href", href)
+    role = attrs.get("role", "")
+    if role:
+        return _attr_selector("", "role", role)
+    for token in _class_token_list(node):
+        return _attr_selector(tag, "class~", token)
+    return _CONTROL_SELECTOR
+
+
+def _attr_selector(tag: str, attr: str, value: str) -> str:
+    prefix = tag or ""
+    return f"{prefix}[{attr}={_css_string(value)}]"
+
+
+def _css_string(value: str) -> str:
+    return '"' + (value or "").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _accepts_match_text(click: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(click)
+    except (TypeError, ValueError):
+        return False
+    positional = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional += 1
+    return positional >= 2
+
+
+def _join_evidence(*parts: str) -> str:
+    return "; ".join(part for part in parts if part)
 
 
 def _absolutize(href: str, page_url: str) -> str:
