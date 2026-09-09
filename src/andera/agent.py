@@ -154,9 +154,8 @@ class EvidenceAgent:
             warnings=warnings,
             metadata=metadata,
         )
-        payload = json.dumps(result.to_dict(), indent=2) + "\n"
-        write_text(metadata_path, payload)
-        artifacts[-1].bytes = metadata_path.stat().st_size
+        payload = _write_result_json(metadata_path, result)
+        artifacts[-1].bytes = len(payload.encode("utf-8"))
         return result
 
     def _run_dir(self, started_at: str) -> Path:
@@ -164,6 +163,26 @@ class EvidenceAgent:
         path = self.out_dir / stamp
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+
+def _write_result_json(path: Path, result: RunResult) -> str:
+    """Serialize result.json so the metadata artifact's byte size matches the file."""
+    size = 0
+    payload = ""
+    for _ in range(8):
+        result.artifacts[-1].bytes = size
+        payload = json.dumps(result.to_dict(), indent=2) + "\n"
+        encoded_size = len(payload.encode("utf-8"))
+        if encoded_size == size:
+            break
+        size = encoded_size
+    write_text(path, payload)
+    on_disk = path.stat().st_size
+    if on_disk != result.artifacts[-1].bytes:
+        raise RuntimeError(
+            f"result.json size mismatch: recorded {result.artifacts[-1].bytes}, on disk {on_disk}"
+        )
+    return payload
 
 
 def _write_artifact(type_name: str, path: Path, description: str, writer) -> Artifact:

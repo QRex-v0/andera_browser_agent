@@ -23,6 +23,13 @@ def test_parse_timeout_and_screenshot() -> None:
     assert task.timeout_ms == 2000
 
 
+def test_parse_class_selector() -> None:
+    task = parse_task(
+        "Collect the current user access list from the access review portal as CSV using selector .access-table"
+    )
+    assert task.required_selector == ".access-table"
+
+
 def test_parse_rejects_empty_task() -> None:
     with pytest.raises(ValueError, match="empty"):
         parse_task("   ")

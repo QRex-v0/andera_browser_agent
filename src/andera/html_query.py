@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 import re
 from html.parser import HTMLParser
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 
 class _Node:
@@ -11,17 +11,36 @@ class _Node:
         self.tag = tag
         self.attrs = attrs
         self.children: List[_Node] = []
-        self.text_parts: List[str] = []
+        self.content: List[Union[str, _Node]] = []
 
     @property
     def text(self) -> str:
-        bits = list(self.text_parts)
-        for child in self.children:
-            bits.append(child.text)
+        bits: List[str] = []
+        for item in self.content:
+            if isinstance(item, str):
+                bits.append(item)
+            else:
+                bits.append(item.text)
         return re.sub(r"\s+", " ", "".join(bits)).strip()
 
 
+class _Selector:
+    def __init__(
+        self,
+        tag: Optional[str] = None,
+        attrs: Optional[Dict[str, str]] = None,
+        classes: Optional[List[str]] = None,
+        element_id: Optional[str] = None,
+    ) -> None:
+        self.tag = tag
+        self.attrs = attrs or {}
+        self.classes = classes or []
+        self.element_id = element_id
+
+
 class _TreeParser(HTMLParser):
+    void_tags = {"br", "img", "hr", "meta", "link", "input"}
+
     def __init__(self) -> None:
         super().__init__()
         self.root = _Node("document", {})
@@ -29,8 +48,10 @@ class _TreeParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: List[tuple[str, Optional[str]]]) -> None:
         node = _Node(tag, {key: value or "" for key, value in attrs})
-        self._stack[-1].children.append(node)
-        if tag not in {"br", "img", "hr", "meta", "link", "input"}:
+        parent = self._stack[-1]
+        parent.children.append(node)
+        parent.content.append(node)
+        if tag not in self.void_tags:
             self._stack.append(node)
 
     def handle_endtag(self, tag: str) -> None:
@@ -40,7 +61,7 @@ class _TreeParser(HTMLParser):
                 break
 
     def handle_data(self, data: str) -> None:
-        self._stack[-1].text_parts.append(data)
+        self._stack[-1].content.append(data)
 
 
 def parse_html(source: str) -> _Node:
@@ -51,11 +72,11 @@ def parse_html(source: str) -> _Node:
 
 
 def query(root: _Node, selector: str) -> List[_Node]:
-    tag, required = _parse_selector(selector)
+    parsed = _parse_selector(selector)
     matches: List[_Node] = []
 
     def walk(node: _Node) -> None:
-        if _matches(node, tag, required):
+        if _matches(node, parsed):
             matches.append(node)
         for child in node.children:
             walk(child)
@@ -94,20 +115,46 @@ def table_to_rows(table: _Node) -> List[Dict[str, str]]:
     return rows
 
 
-def _parse_selector(selector: str) -> tuple[Optional[str], Dict[str, str]]:
+def _parse_selector(selector: str) -> _Selector:
     raw = selector.strip()
-    if raw.startswith("#"):
-        return None, {"id": raw[1:]}
-    if raw.startswith("[") and raw.endswith("]"):
-        key, value = _split_attr(raw[1:-1])
-        return None, {key: value}
-    match = re.fullmatch(r"([a-zA-Z0-9_-]+)(\[([^=]+)=['\"]?([^'\"]+)['\"]?\])?", raw)
-    if not match:
+    if not raw:
+        raise ValueError("Unsupported selector: empty")
+
+    parsed = _Selector()
+    rest = raw
+    tag_match = re.match(r"^[a-zA-Z][\w-]*", rest)
+    if tag_match:
+        parsed.tag = tag_match.group(0)
+        rest = rest[tag_match.end() :]
+
+    while rest:
+        if rest.startswith("#"):
+            match = re.match(r"^#([\w-]+)", rest)
+            if not match:
+                raise ValueError(f"Unsupported selector: {selector}")
+            parsed.element_id = match.group(1)
+            rest = rest[match.end() :]
+            continue
+        if rest.startswith("."):
+            match = re.match(r"^\.([\w-]+)", rest)
+            if not match:
+                raise ValueError(f"Unsupported selector: {selector}")
+            parsed.classes.append(match.group(1))
+            rest = rest[match.end() :]
+            continue
+        if rest.startswith("["):
+            match = re.match(r"^\[([^\]]+)\]", rest)
+            if not match:
+                raise ValueError(f"Unsupported selector: {selector}")
+            key, value = _split_attr(match.group(1))
+            parsed.attrs[key] = html.unescape(value)
+            rest = rest[match.end() :]
+            continue
         raise ValueError(f"Unsupported selector: {selector}")
-    tag = match.group(1)
-    if match.group(3):
-        return tag, {match.group(3).strip(): html.unescape(match.group(4))}
-    return tag, {}
+
+    if parsed.tag is None and not parsed.attrs and not parsed.classes and parsed.element_id is None:
+        raise ValueError(f"Unsupported selector: {selector}")
+    return parsed
 
 
 def _split_attr(body: str) -> tuple[str, str]:
@@ -115,12 +162,18 @@ def _split_attr(body: str) -> tuple[str, str]:
     return key.strip(), value.strip().strip("\"'")
 
 
-def _matches(node: _Node, tag: Optional[str], required: Dict[str, str]) -> bool:
+def _matches(node: _Node, selector: _Selector) -> bool:
     if node.tag == "document":
         return False
-    if tag and node.tag != tag:
+    if selector.tag and node.tag != selector.tag:
         return False
-    for key, value in required.items():
+    if selector.element_id and node.attrs.get("id") != selector.element_id:
+        return False
+    node_classes = node.attrs.get("class", "").split()
+    for class_name in selector.classes:
+        if class_name not in node_classes:
+            return False
+    for key, value in selector.attrs.items():
         if node.attrs.get(key) != value:
             return False
     return True

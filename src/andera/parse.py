@@ -76,7 +76,11 @@ def _extract_url(text: str) -> str | None:
 
 
 def _extract_selector(text: str) -> str | None:
-    match = re.search(r"selector\s+([#.\[][\w=\'\"\-\[\]]+|[a-z]+(?:\[[^\]]+\])?)", text, re.I)
+    match = re.search(
+        r"selector\s+((?:[a-zA-Z][\w-]*)?(?:[#.][\w-]+|\[[^\]]+\])+|[a-zA-Z][\w-]+)",
+        text,
+        re.I,
+    )
     return match.group(1) if match else None
 
 

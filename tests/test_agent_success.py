@@ -37,6 +37,18 @@ def test_collects_access_list_csv_and_metadata(agent: EvidenceAgent) -> None:
     payload = json.loads(Path(meta_artifact.path).read_text(encoding="utf-8"))
     assert payload["status"] == "success"
     assert payload["metadata"]["row_count"] == 3
+    recorded = next(item["bytes"] for item in payload["artifacts"] if item["type"] == "metadata")
+    assert recorded == Path(meta_artifact.path).stat().st_size
+    assert recorded == meta_artifact.bytes
+
+
+def test_collects_access_list_with_class_selector(agent: EvidenceAgent) -> None:
+    result = agent.run(
+        "Collect the current user access list from the access review portal as CSV using selector .access-table"
+    )
+    assert result.status == RunStatus.SUCCESS
+    assert result.task.required_selector == ".access-table"
+    assert result.metadata["row_count"] == 3
 
 
 def test_cli_success(out_dir: Path) -> None:
