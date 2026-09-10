@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
-from andera.evidence import EvidenceStore, extract_table_schema, extract_visible_text, sha256_hex
+from andera.evidence import EvidenceStore, extract_table_schema, extract_visible_text, sha256_hex, write_csv
 from andera.html_query import node_visible_text, parse_html, query
 from andera.content_index import _absolutize, discover_content_index, iter_content_items, resolve_most_recent
 from andera.list_extract import (
@@ -16,7 +16,10 @@ from andera.list_extract import (
     collect_incremental_schema_rows,
     detail_values,
     extract_schema_rows,
+    identifier_from_url,
     is_detail_field,
+    item_page_url,
+    parse_owner_repo_id,
     public_rows,
     related_detail_link,
     reviewer_resolution_note,
@@ -33,7 +36,21 @@ from andera.models import (
     utc_now,
     worse_status,
 )
-from andera.schema import infer_sort_spec, infer_status_filters, split_unmet_fields
+from andera.env import load_local_env
+from andera.schema import (
+    infer_sort_spec,
+    infer_status_filters,
+    is_identifier_column,
+    is_pr_like_columns,
+    map_detail_to_columns,
+    canonical_detail_key,
+    split_unmet_fields,
+)
+
+try:
+    from andera.pr_detail import fetch_pr_detail
+except ImportError:  # Codex module may land later; fallback keeps the same signature.
+    from andera.github_pr import fetch_pr_detail
 from andera.observe import inspect_from_html, observation_digest, observation_from_html
 from andera.planner import Planner, RulePlanner, _missing_screenshot_role
 from andera.targets import listed_targets, target_slug
@@ -1019,6 +1036,7 @@ def _capture_screenshot(
     full_page: Any = None,
     role: str = "",
     trajectory: Optional[List[TrajectoryEvent]] = None,
+    suffix: str = "",
 ) -> tuple[RunStatus, str]:
     role = role or "final"
     existing = [
@@ -1026,13 +1044,24 @@ def _capture_screenshot(
         for item in artifacts
         if item.type == "screenshot" and _artifact_role(item) == role
     ]
-    if existing:
+    if existing and role != "pull_request_page":
+        return status, "screenshot_captured"
+    if role == "pull_request_page" and spec.row_limit > 0 and len(existing) >= spec.row_limit:
         return status, "screenshot_captured"
     current_url = ""
     try:
         current_url = browser.current_url() or ""
     except Exception:
         current_url = ""
+    if role == "pull_request_page":
+        item_url = item_page_url(current_url)
+        if item_url and item_url.rstrip("/") != current_url.rstrip("/"):
+            try:
+                browser.goto(item_url)
+                current_url = browser.current_url() or item_url
+                html = _safe_content(browser) or html
+            except Exception:
+                current_url = item_url or current_url
     if not page_belongs_to_target(current_url, spec.target_url, trajectory or []):
         record(
             "screenshot",
@@ -1050,8 +1079,14 @@ def _capture_screenshot(
         return status, "screenshot_rejected"
     use_full_page = spec.screenshot_scope != "viewport" if full_page is None else bool(full_page)
     target_name = listed_targets(spec)[0].name if listed_targets(spec) else ""
-    filename = _screenshot_filename(target_name, role)
+    shot_suffix = str(suffix or "").strip()
+    if role == "pull_request_page" and not shot_suffix:
+        shot_suffix = identifier_from_url(current_url) or str(len(existing) + 1)
+    filename = _screenshot_filename(target_name, role, shot_suffix)
     screenshot_path = store.evidence_dir / filename
+    if screenshot_path.exists():
+        filename = _screenshot_filename(target_name, role, f"{shot_suffix or role}-{len(existing) + 1}")
+        screenshot_path = store.evidence_dir / filename
     metrics = _page_metrics(browser)
     http_status = _last_http_status(browser)
     error_kind = _error_page_kind(html, http_status) or (
@@ -1343,8 +1378,10 @@ def _settle_browser(browser: Any, timeout_ms: int) -> None:
             return
 
 
-def _screenshot_filename(target_name: str, role: str) -> str:
+def _screenshot_filename(target_name: str, role: str, suffix: str = "") -> str:
     parts = [target_slug(target_name) if target_name else "", target_slug(role) if role else "final"]
+    if suffix:
+        parts.append(target_slug(str(suffix)))
     stem = "-".join(part for part in parts if part)
     return f"screenshot-{stem}.png"
 
@@ -1355,17 +1392,20 @@ def _screenshot_description(role: str, full_page: bool) -> str:
         "homepage": "homepage screenshot",
         "latest_content": "latest content screenshot",
         "final": "screenshot",
+        "pull_request_page": "pull request page screenshot",
     }
     return f"{scope} {labels.get(role, role + ' screenshot')}"
 
 
 def _artifact_role(artifact: Artifact) -> str:
     description = (artifact.description or "").lower()
+    path = Path(artifact.path).name.lower()
+    if "pull request page" in description or "pull-request-page" in path or "pull_request_page" in path:
+        return "pull_request_page"
     if "homepage" in description:
         return "homepage"
     if "latest content" in description:
         return "latest_content"
-    path = Path(artifact.path).name.lower()
     if "homepage" in path:
         return "homepage"
     if "latest-content" in path or "latest_content" in path:
@@ -1433,6 +1473,7 @@ def _extract(
     if spec.required_columns:
         sort_spec = infer_sort_spec(spec.raw)
         status_filters = infer_status_filters(spec.raw)
+        collect_limit = _collection_row_limit(spec, sort_spec, status_filters)
         if spec.row_limit > 0:
             first_html = html
             columns, rows, method, unmet, collection = collect_incremental_schema_rows(
@@ -1440,7 +1481,7 @@ def _extract(
                 html,
                 page_url,
                 spec.required_columns,
-                row_limit=spec.row_limit,
+                row_limit=collect_limit,
                 status_filters=status_filters,
                 sort_spec=sort_spec,
                 max_seconds=max(0.1, remaining_ms / 1000.0) if remaining_ms else 20.0,
@@ -1448,12 +1489,12 @@ def _extract(
             if metadata is not None:
                 metadata["list_collection"] = _list_collection_metadata(collection)
             html = _safe_content(browser) or html
-            if spec.row_limit > 0 and len(rows) < spec.row_limit:
+            if collect_limit > 0 and len(rows) < collect_limit:
                 static_cols, static_rows, static_method, static_unmet = extract_schema_rows(
                     first_html,
                     page_url,
                     spec.required_columns,
-                    row_limit=spec.row_limit,
+                    row_limit=collect_limit,
                     table_columns=table_columns,
                     table_rows=table_rows,
                     status_filters=status_filters,
@@ -1479,6 +1520,7 @@ def _extract(
         if (
             sort_spec.kind == "time"
             and spec.row_limit > 0
+            and collect_limit <= spec.row_limit
             and rows
             and all(str(row.get("_sort_key") or "").strip() for row in rows)
         ):
@@ -1486,32 +1528,43 @@ def _extract(
         needs_detail = any(is_detail_field(name) for name in columns) or (
             sort_spec.kind == "time" and any(not str(row.get("_sort_key") or "").strip() for row in rows)
         )
-        if remaining_ms > 0 and (unmet or needs_detail):
+        can_api = any(_row_repo_ref(row) for row in rows)
+        if remaining_ms > 0 and (unmet or needs_detail or can_api):
             rows, html, enrich_step = _enrich_rows(
-                browser, spec, rows, columns, record, remaining_ms, sort_spec
+                browser, spec, rows, columns, record, remaining_ms, sort_spec, metadata
             )
             if enrich_step or rows:
                 unmet = split_unmet_fields(public_rows(rows, columns), columns)
-        if sort_spec.kind == "time":
+        if any(str(row.get("_merged_at") or "").strip() for row in rows):
+            rows = _sort_rows_by_merged_at(rows, spec.row_limit)
+        elif sort_spec.kind == "time":
             rows, sort_unmet = apply_semantic_sort(rows, sort_spec, spec.row_limit)
             unmet.extend(item for item in sort_unmet if item not in unmet)
+        elif spec.row_limit > 0 and len(rows) > spec.row_limit:
+            rows = rows[: spec.row_limit]
+        if spec.required_columns:
+            unmet = split_unmet_fields(public_rows(rows, columns), columns)
+        if _should_capture_item_screenshots(spec, columns):
+            html = _capture_row_screenshots(
+                browser=browser,
+                spec=spec,
+                store=store,
+                artifacts=artifacts,
+                errors=errors,
+                record=record,
+                status=status,
+                html=html,
+                metadata=metadata or {},
+                trajectory=trajectory or [],
+                rows=rows,
+            )
     else:
         columns, rows = table_columns, table_rows
         if spec.row_limit > 0:
             rows = rows[: spec.row_limit]
         event = record(action_name, {"selector": selector or "table", "method": method}, "ok", html)
     csv_rows = public_rows(rows, columns) if spec.required_columns else rows
-    if not any(item.type == "csv" for item in artifacts):
-        artifacts.append(
-            store.write_csv_artifact(
-                "evidence/extracted-table.csv",
-                csv_rows,
-                "Extracted table",
-                source_url=page_url,
-                trajectory_step=event.step,
-                fieldnames=columns,
-            )
-        )
+    _write_or_replace_csv(store, artifacts, csv_rows, columns, page_url, event.step)
     if spec.expect_rows and not csv_rows:
         status = worse_status(status, RunStatus.PARTIAL)
         errors.append(
@@ -1546,13 +1599,20 @@ def _extract(
     return columns, rows, event.step, status
 
 
-def _enrich_rows(browser, spec, rows, columns, record, remaining_ms: int, sort_spec=None):
+def _enrich_rows(browser, spec, rows, columns, record, remaining_ms: int, sort_spec=None, metadata=None):
     last_html = ""
     last_step = 0
     deadline = time.monotonic() + max(0, remaining_ms) / 1000
+    load_local_env()
     for row in rows:
         if time.monotonic() >= deadline:
             break
+        _join_api_detail(row, columns, metadata)
+    for row in rows:
+        if time.monotonic() >= deadline:
+            break
+        if row.get("_api_joined") or _row_repo_ref(row):
+            continue
         needs_sort = bool(sort_spec) and getattr(sort_spec, "kind", "") == "time" and not str(row.get("_sort_key") or "").strip()
         if not split_unmet_fields([row], columns) and not needs_sort:
             continue
@@ -1606,7 +1666,7 @@ def _merge_detail(
         if not incoming:
             continue
         current = str(row.get(column, "")).strip()
-        if current and not _needs_page_detail([column]):
+        if current and not (_needs_page_detail([column]) or is_identifier_column(column)):
             continue
         row[column] = filled[column]
         if isinstance(sources, dict) and source_url:
@@ -1618,6 +1678,231 @@ def _merge_detail(
     incoming_sort = str(filled.get("_sort_key") or "").strip()
     if incoming_sort and not str(row.get("_sort_key") or "").strip():
         row["_sort_key"] = incoming_sort
+
+
+def _collection_row_limit(spec: TaskSpec, sort_spec, status_filters: Sequence[str]) -> int:
+    limit = spec.row_limit
+    if limit > 0 and getattr(sort_spec, "kind", "") == "time" and "merged" in {str(item).lower() for item in status_filters}:
+        return max(limit, 25)
+    return limit
+
+
+def _sort_rows_by_merged_at(rows: List[Dict[str, str]], row_limit: int) -> List[Dict[str, str]]:
+    dated = [row for row in rows if str(row.get("_merged_at") or row.get("_sort_key") or "").strip()]
+    dated.sort(
+        key=lambda row: str(row.get("_merged_at") or row.get("_sort_key") or ""),
+        reverse=True,
+    )
+    if row_limit > 0:
+        return dated[:row_limit] if dated else rows[:row_limit]
+    return dated or rows
+
+
+def _row_repo_ref(row: Dict[str, str]) -> Optional[Tuple[str, str, int]]:
+    for key in ("_detail_url", "_target_url", "_source_url"):
+        parsed = parse_owner_repo_id(str(row.get(key) or ""))
+        if parsed:
+            return parsed
+    for key, value in row.items():
+        if str(key).startswith("_"):
+            continue
+        text = str(value or "")
+        if "://" in text:
+            parsed = parse_owner_repo_id(text)
+            if parsed:
+                return parsed
+    return None
+
+
+def _reviews_were_empty(detail: Dict[str, Any]) -> bool:
+    reviewers = detail.get("reviewers")
+    if reviewers is None or reviewers == "":
+        return True
+    if isinstance(reviewers, str):
+        return not reviewers.strip()
+    if isinstance(reviewers, (list, tuple)):
+        return not any(str(item).strip() for item in reviewers)
+    return False
+
+
+def _reviews_endpoint_url(detail: Dict[str, Any], owner: str, repo: str, number: int) -> str:
+    for raw in detail.get("source_urls") or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = urlparse(text).path.rstrip("/")
+        if path.endswith("/reviews") and not path.endswith("/requested_reviewers"):
+            return text
+    return f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews"
+
+
+def _record_zero_reviews(
+    metadata: Optional[Dict[str, Any]],
+    detail: Dict[str, Any],
+    columns: Sequence[str],
+    owner: str,
+    repo: str,
+    number: int,
+) -> None:
+    if metadata is None or not _reviews_were_empty(detail):
+        return
+    review_columns = [column for column in columns if canonical_detail_key(column) == "reviewers"]
+    if not review_columns:
+        return
+    endpoint = _reviews_endpoint_url(detail, owner, repo, number)
+    pr_number = detail.get("pr_number")
+    if pr_number in (None, ""):
+        pr_number = number
+    else:
+        try:
+            pr_number = int(pr_number)
+        except (TypeError, ValueError):
+            pr_number = number
+    entries = metadata.setdefault("empty_fields", [])
+    if not isinstance(entries, list):
+        entries = []
+        metadata["empty_fields"] = entries
+    for column in review_columns:
+        entries.append(
+            {
+                "column": column,
+                "reason": "zero_reviews",
+                "endpoint": endpoint,
+                "pr_number": pr_number,
+            }
+        )
+
+
+def _join_api_detail(
+    row: Dict[str, str],
+    columns: Sequence[str],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    parsed = _row_repo_ref(row)
+    if not parsed:
+        return False
+    owner, repo, number = parsed
+    try:
+        load_local_env()
+        detail = fetch_pr_detail(owner, repo, number)
+    except Exception:
+        _clear_canonical_columns(row, columns)
+        return False
+    if not isinstance(detail, dict):
+        _clear_canonical_columns(row, columns)
+        return False
+    mapped = map_detail_to_columns(detail, list(columns))
+    sources = row.setdefault("_field_source", {})
+    for column in columns:
+        if not canonical_detail_key(column):
+            continue
+        row[column] = mapped.get(column, "")
+        api_urls = detail.get("source_urls") or []
+        if isinstance(sources, dict) and api_urls:
+            sources[column] = str(api_urls[0])
+    merged_at = str(detail.get("merged_at") or "").strip()
+    if merged_at:
+        row["_merged_at"] = merged_at
+        row["_sort_key"] = merged_at
+    if detail.get("pr_number") not in (None, ""):
+        row["_pr_number"] = str(detail["pr_number"])
+    _ensure_row_identifier(row, columns)
+    row["_api_joined"] = "1"
+    _record_zero_reviews(metadata, detail, columns, owner, repo, number)
+    return True
+
+
+def _clear_canonical_columns(row: Dict[str, str], columns: Sequence[str]) -> None:
+    for column in columns:
+        if canonical_detail_key(column) and canonical_detail_key(column) != "pr_number":
+            row[column] = ""
+    _ensure_row_identifier(row, columns)
+
+
+def _ensure_row_identifier(row: Dict[str, str], columns: Sequence[str]) -> None:
+    ident = str(row.get("_pr_number") or identifier_from_url(str(row.get("_detail_url") or "")) or "").strip()
+    if not ident:
+        return
+    row["_pr_number"] = ident
+    for column in columns:
+        if canonical_detail_key(column) == "pr_number" and not str(row.get(column) or "").strip():
+            row[column] = ident
+
+
+def _should_capture_item_screenshots(spec: TaskSpec, columns: Sequence[str]) -> bool:
+    if "pull_request_page" in spec.screenshot_roles:
+        return True
+    return spec.row_limit == 10 and is_pr_like_columns(list(columns) or list(spec.required_columns))
+
+
+def _capture_row_screenshots(
+    *,
+    browser,
+    spec: TaskSpec,
+    store,
+    artifacts,
+    errors,
+    record,
+    status,
+    html: str,
+    metadata: Dict[str, Any],
+    trajectory: List[TrajectoryEvent],
+    rows: List[Dict[str, str]],
+) -> str:
+    last_html = html
+    warnings: List[Issue] = []
+    for index, row in enumerate(rows, start=1):
+        raw_url = str(row.get("_detail_url") or row.get("_target_url") or "")
+        url = item_page_url(raw_url) or raw_url
+        if not url:
+            continue
+        try:
+            browser.goto(url)
+        except Exception:
+            continue
+        last_html = _safe_content(browser)
+        record("navigate", {"url": url, "purpose": "item_page"}, "ok", last_html)
+        suffix = str(row.get("_pr_number") or identifier_from_url(url) or index)
+        _capture_screenshot(
+            browser=browser,
+            spec=spec,
+            store=store,
+            artifacts=artifacts,
+            errors=errors,
+            warnings=warnings,
+            record=record,
+            status=status,
+            html=last_html,
+            risk=ActionRisk.READ.value,
+            metadata=metadata,
+            role="pull_request_page",
+            trajectory=trajectory,
+            suffix=suffix,
+        )
+    return last_html or html
+
+
+def _write_or_replace_csv(store, artifacts, csv_rows, columns, page_url: str, step: int) -> None:
+    existing = next((item for item in artifacts if item.type == "csv"), None)
+    if existing:
+        path = Path(existing.path)
+        write_csv(csv_rows, path, fieldnames=columns)
+        data = path.read_bytes()
+        existing.bytes = len(data)
+        existing.sha256 = sha256_hex(data)
+        existing.source_url = page_url or existing.source_url
+        existing.trajectory_step = step
+        return
+    artifacts.append(
+        store.write_csv_artifact(
+            "evidence/extracted-table.csv",
+            csv_rows,
+            "Extracted table",
+            source_url=page_url,
+            trajectory_step=step,
+            fieldnames=columns,
+        )
+    )
 
 
 def _needs_page_detail(columns: List[str]) -> bool:

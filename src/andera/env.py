@@ -40,6 +40,15 @@ def openai_api_key() -> str:
     return key
 
 
+def github_token() -> str:
+    """Return GITHUB_TOKEN from the process environment or .env.local.
+
+    The value is never logged or included in returned planner/action payloads.
+    """
+    load_local_env()
+    return (os.environ.get("GITHUB_TOKEN") or "").strip()
+
+
 def declared_user_agent() -> str:
     """Operator identity for automated HTTP requests: 'Name contact@domain'."""
     load_local_env()

@@ -6,16 +6,20 @@ from pathlib import Path
 from andera.agent import EvidenceAgent
 from andera.executor import (
     _click_destination,
+    _collection_row_limit,
     _href_from_html,
     _is_auth_wall,
     _is_site_stop_page,
     _is_vague_locator,
+    _join_api_detail,
     _observation_loop,
     _site_stop_status,
+    _sort_rows_by_merged_at,
 )
-from andera.models import BrowserAction, RunStatus, TaskSpec
+from andera.schema import infer_sort_spec, infer_status_filters
+from andera.models import BrowserAction, RunStatus, TaskSpec, TrajectoryEvent
 from andera.observe import observation_from_html
-from andera.planner import DECIDE_INSTRUCTIONS, RulePlanner
+from andera.planner import DECIDE_INSTRUCTIONS, RulePlanner, _missing_screenshot_role
 from andera.parse import parse_task
 from test_multi_target import ScriptedBrowser, _liveness_spec
 
@@ -486,6 +490,200 @@ def test_deferred_table_is_not_blocked_as_auth_wall(tmp_path: Path, out_dir: Pat
     assert result.status != RunStatus.BLOCKED
     assert any(item.type == "csv" for item in result.artifacts)
     assert result.metadata.get("row_count", 0) >= 1
+
+
+def test_collects_extra_then_sorts_by_merged_at() -> None:
+    spec = parse_task(
+        "Go to example.com/repo, find the last 10 merged PRs, and create a CSV of "
+        "PR number, who committed, who reviewed, and who merged"
+    )
+    assert spec.row_limit == 10
+    assert (
+        _collection_row_limit(spec, infer_sort_spec(spec.raw), infer_status_filters(spec.raw))
+        == 25
+    )
+    ranked = parse_task(
+        "Create a CSV of the top 5 stories with title, URL, and points",
+        target_url="https://stories.example/",
+    )
+    assert _collection_row_limit(ranked, infer_sort_spec(ranked.raw), []) == 5
+    rows = [
+        {"pr #": str(index), "_merged_at": f"2026-01-{index:02d}T00:00:00Z"}
+        for index in range(1, 16)
+    ]
+    rows.append({"pr #": "99", "_merged_at": "2026-09-01T00:00:00Z"})
+    out = _sort_rows_by_merged_at(rows, 10)
+    assert len(out) == 10
+    assert out[0]["pr #"] == "99"
+    assert [row["pr #"] for row in out[1:]] == [str(index) for index in range(15, 6, -1)]
+
+
+def test_api_join_clears_list_page_guesses(monkeypatch) -> None:
+    def fake_fetch(owner, repo, pr_number):
+        del owner, repo
+        if int(pr_number) == 2:
+            return {
+                "pr_number": 2,
+                "committers": ["ann"],
+                "reviewers": ["approved: cam"],
+                "merged_by": "dan",
+                "merged_at": "2026-06-01T00:00:00Z",
+                "source_urls": ["https://api.example/2"],
+            }
+        return {
+            "pr_number": int(pr_number),
+            "committers": [],
+            "reviewers": [],
+            "merged_by": None,
+            "merged_at": None,
+            "source_urls": ["https://api.example/3"],
+        }
+
+    monkeypatch.setattr("andera.executor.fetch_pr_detail", fake_fetch)
+    filled = {
+        "pr #": "",
+        "who committed": "list-guess",
+        "who reviewed": "list-guess",
+        "who merged": "list-guess",
+        "_detail_url": "https://host.example/acme/tools/pull/2",
+    }
+    assert _join_api_detail(filled, ["pr #", "who committed", "who reviewed", "who merged"])
+    assert filled["pr #"] == "2"
+    assert filled["who committed"] == "ann"
+    assert filled["who reviewed"] == "approved: cam"
+    assert filled["who merged"] == "dan"
+    empty = {
+        "pr #": "9",
+        "who committed": "list-guess",
+        "who reviewed": "list-guess",
+        "who merged": "list-guess",
+        "_detail_url": "https://host.example/acme/tools/pull/3",
+    }
+    assert _join_api_detail(empty, ["pr #", "who committed", "who reviewed", "who merged"])
+    assert empty["pr #"] == "3"
+    assert empty["who committed"] == ""
+    assert empty["who reviewed"] == ""
+    assert empty["who merged"] == ""
+
+
+def test_empty_reviewers_records_reviews_endpoint_in_metadata(monkeypatch) -> None:
+    reviews_url = "https://api.github.com/repos/acme/tools/pulls/3/reviews"
+
+    def fake_fetch(owner, repo, pr_number):
+        del owner, repo
+        return {
+            "pr_number": int(pr_number),
+            "committers": [],
+            "reviewers": [],
+            "merged_by": None,
+            "merged_at": None,
+            "source_urls": [reviews_url],
+        }
+
+    monkeypatch.setattr("andera.executor.fetch_pr_detail", fake_fetch)
+    row = {
+        "pr #": "3",
+        "who committed": "",
+        "who reviewed": "",
+        "who merged": "",
+        "_detail_url": "https://host.example/acme/tools/pull/3",
+    }
+    metadata: dict = {}
+    columns = ["pr #", "who committed", "who reviewed", "who merged"]
+    assert _join_api_detail(row, columns, metadata)
+    assert row["who reviewed"] == ""
+    assert metadata["empty_fields"] == [
+        {
+            "column": "who reviewed",
+            "reason": "zero_reviews",
+            "endpoint": reviews_url,
+            "pr_number": 3,
+        }
+    ]
+
+
+def test_missing_screenshot_role_counts_pull_request_pages() -> None:
+    spec = parse_task(
+        "Go to example.com/repo, find the last 10 merged PRs, take a screenshot of each "
+        "pull request page, and create a CSV of PR number, who committed, who reviewed, "
+        "and who merged"
+    )
+    assert spec.screenshot_roles == ["pull_request_page"]
+    events = [
+        TrajectoryEvent(
+            step=index,
+            timestamp="2026-01-01T00:00:00Z",
+            action="screenshot",
+            args={"role": "pull_request_page"},
+            url=f"https://host.example/acme/tools/pull/{index}",
+            observation_digest="",
+            outcome="ok",
+        )
+        for index in range(1, 10)
+    ]
+    assert _missing_screenshot_role(spec, events) == "pull_request_page"
+    events.append(
+        TrajectoryEvent(
+            step=10,
+            timestamp="2026-01-01T00:00:00Z",
+            action="screenshot",
+            args={"role": "pull_request_page"},
+            url="https://host.example/acme/tools/pull/10",
+            observation_digest="",
+            outcome="ok",
+        )
+    )
+    assert _missing_screenshot_role(spec, events) == ""
+
+
+def test_multiple_same_role_pull_request_screenshots(tmp_path: Path, out_dir: Path) -> None:
+    pages = {
+        "https://items.example/list": """
+        <html><body>
+          <div class="item"><a href="https://items.example/101">Fix login item title</a> Merged</div>
+          <div class="item"><a href="https://items.example/102">Add tests item title</a> Merged</div>
+          <div class="item"><a href="https://items.example/103">Open work item title</a> Open</div>
+        </body></html>
+        """,
+        "https://items.example/101": """
+        <html><body>
+          <h1>Fix login #101</h1>
+          <p>alice committed</p>
+          <p>zoe approved</p>
+          <p>Reviewers zoe</p>
+          <p>bob merged Jan 1, 2026</p>
+          <time datetime="2026-01-01">Jan 1</time>
+        </body></html>
+        """,
+        "https://items.example/102": """
+        <html><body>
+          <h1>Add tests #102</h1>
+          <p>cara committed</p>
+          <p>dave approved</p>
+          <p>Reviewers eve</p>
+          <p>cara merged Jun 1, 2026</p>
+          <time datetime="2026-06-01">Jun 1</time>
+        </body></html>
+        """,
+        "https://items.example/103": "<html><body><h1>Open #103</h1></body></html>",
+    }
+    spec = parse_task(
+        "Go to items.example/list, find the last 2 merged items, take a screenshot of each "
+        "pull request page, and create a CSV of PR number, who committed, who reviewed, "
+        "and who merged",
+        target_url="https://items.example/list",
+        timeout_ms=5000,
+    )
+    result = EvidenceAgent(ScriptedBrowser(pages), out_dir, planner=RulePlanner()).run(spec)
+    shots = [item for item in result.artifacts if item.type == "screenshot"]
+    assert len(shots) == 2
+    assert {item.source_url.rstrip("/") for item in shots} == {
+        "https://items.example/101",
+        "https://items.example/102",
+    }
+    assert all("/commits" not in (item.source_url or "") for item in shots)
+    names = [Path(item.path).name for item in shots]
+    assert len(set(names)) == 2
 
 
 def test_exhausted_step_budget_is_timeout(tmp_path: Path, out_dir: Path) -> None:

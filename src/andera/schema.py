@@ -22,6 +22,27 @@ INT_COLUMNS = {
     "number",
     "pr number",
     "pr",
+    "pr #",
+    "pr#",
+}
+_IDENTIFIER_COLUMNS = {
+    "pr",
+    "id",
+    "pr number",
+    "pr #",
+    "pr#",
+    "pr id",
+    "pull",
+    "pull number",
+    "pull request",
+    "pull request number",
+}
+_DETAIL_ALIASES = {
+    "pr_number": ("pr_number", "pr number", "pr #", "pr#", "pr", "id", "pr id"),
+    "committers": ("committers", "who committed", "committed", "committer"),
+    "reviewers": ("reviewers", "who reviewed", "reviewed", "reviewer"),
+    "merged_by": ("merged_by", "who merged", "merged by", "merger"),
+    "merged_at": ("merged_at", "merged at"),
 }
 URL_COLUMNS = {"url", "link", "href", "uri", "website"}
 URL_ALIASES = {"uri": "url", "href": "url", "link": "url", "website": "url"}
@@ -122,12 +143,85 @@ def mentions_content_index(text: str) -> bool:
     return bool(re.search(_CONTENT_INDEX_HINT, text or "", re.I))
 
 
+def is_identifier_column(name: str) -> bool:
+    key = (name or "").strip().lower()
+    compact = re.sub(r"[\s_]+", "", key)
+    if key in _IDENTIFIER_COLUMNS or compact in {"pr", "id", "prnumber", "pr#", "prid"}:
+        return True
+    if key.endswith("#") or key.endswith(" #"):
+        return True
+    if "pr" in key and ("number" in key or "#" in key):
+        return True
+    return False
+
+
+def is_pr_like_columns(columns: List[str]) -> bool:
+    if not columns:
+        return False
+    has_id = any(is_identifier_column(name) or "number" in name.lower() for name in columns)
+    actors = 0
+    for name in columns:
+        key = name.lower()
+        if key.startswith("who ") or any(
+            token in key for token in ("reviewed", "reviewer", "merged", "committed", "committer")
+        ):
+            actors += 1
+    return has_id and actors >= 2
+
+
+def _ranked_list_columns(columns: List[str]) -> bool:
+    keys = {name.lower() for name in columns}
+    titled = bool(keys & {"title", "headline", "name"})
+    ranked = bool(keys & {"points", "score", "rank", "votes"})
+    return titled and ranked
+
+
 def infer_screenshot_roles(text: str) -> List[str]:
     if not needs_screenshot(text):
         return []
+    columns = infer_required_columns(text)
+    if _ranked_list_columns(columns):
+        return ["final"]
     if needs_most_recent(text) or mentions_content_index(text):
         return ["homepage", "latest_content"]
+    if infer_row_limit(text) > 0 and is_pr_like_columns(columns):
+        return ["pull_request_page"]
     return ["final"]
+
+
+def canonical_detail_key(column: str) -> str:
+    key = normalize_column_name(column)
+    compact = key.replace(" ", "").replace("_", "")
+    if is_identifier_column(column) or compact in {"prnumber", "pr#", "pr"}:
+        return "pr_number"
+    for canonical, aliases in _DETAIL_ALIASES.items():
+        if key in aliases or compact == canonical.replace("_", ""):
+            return canonical
+    return ""
+
+
+def map_detail_to_columns(detail: Dict[str, object], columns: List[str]) -> Dict[str, str]:
+    mapped: Dict[str, str] = {}
+    payload = detail or {}
+    for column in columns:
+        canonical = canonical_detail_key(column)
+        if not canonical:
+            continue
+        if canonical == "pr_number":
+            value = payload.get("pr_number")
+            mapped[column] = str(value) if value not in (None, "") else ""
+        elif canonical in {"committers", "reviewers"}:
+            items = payload.get(canonical) or []
+            if isinstance(items, str):
+                mapped[column] = items.strip()
+            else:
+                mapped[column] = "; ".join(
+                    str(item).strip() for item in items if str(item).strip()
+                )
+        else:
+            raw = payload.get(canonical)
+            mapped[column] = str(raw).strip() if raw not in (None, "") else ""
+    return mapped
 
 
 def infer_named_targets(text: str) -> List[str]:
@@ -248,7 +342,13 @@ def column_type(name: str) -> str:
     key = (name or "").strip().lower()
     if key in URL_COLUMNS or key.endswith(" url") or key.endswith("_url"):
         return "absolute_url"
-    if key in INT_COLUMNS or key.endswith(" count") or key.endswith(" number") or key == "pr number":
+    if (
+        is_identifier_column(key)
+        or key in INT_COLUMNS
+        or key.endswith(" count")
+        or key.endswith(" number")
+        or key.endswith("#")
+    ):
         return "integer"
     return "text"
 

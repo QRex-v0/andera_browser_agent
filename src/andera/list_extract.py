@@ -3,13 +3,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import urljoin, urlparse, unquote, urlunsplit
 
 from andera.html_query import node_visible_text, parse_html, table_to_rows
 from andera.schema import (
     SortSpec,
     column_type,
     is_absolute_http_url,
+    is_identifier_column,
     parse_integer,
     parse_when,
     split_unmet_fields,
@@ -218,8 +219,8 @@ def detail_values(
     values: Dict[str, str] = {}
     for column in columns:
         key = column.lower()
-        if "number" in key or key in {"pr", "id"}:
-            values[column] = _identifier_from_url(page_url, text)
+        if is_identifier_column(column) or "number" in key or key in {"pr", "id"}:
+            values[column] = identifier_from_url(page_url, text)
         elif "merged" in key:
             values[column] = ", ".join(_actors(text, "merged"))
         elif "committed" in key or key.endswith("commit") or "committers" in key:
@@ -439,10 +440,10 @@ def _project_record(record: RawRecord, columns: Sequence[str]) -> Dict[str, str]
             row[column] = record.title
         elif key in {"text", "full text", "content", "snippet", "excerpt"}:
             row[column] = record.target_text or _labeled_text(record.text, column)
-        elif "number" in key or key in {"pr", "id"}:
-            row[column] = _identifier_from_url(record.url, f"{record.title} {record.text}")
+        elif is_identifier_column(column) or "number" in key or key in {"pr", "id"}:
+            row[column] = identifier_from_url(record.url, f"{record.title} {record.text}")
         elif kind == "integer":
-            row[column] = _labeled_integer(record.text, column) or _identifier_from_url(
+            row[column] = _labeled_integer(record.text, column) or identifier_from_url(
                 record.url, f"{record.title} {record.text}"
             )
         elif is_detail_field(column):
@@ -875,7 +876,7 @@ def _time_tag_values_from_nodes(nodes: Sequence) -> List[str]:
     return found
 
 
-def _identifier_from_url(url: str, text: str = "") -> str:
+def identifier_from_url(url: str, text: str = "") -> str:
     match = re.search(r"#(\d+)\b", text or "")
     if match:
         return match.group(1)
@@ -884,6 +885,51 @@ def _identifier_from_url(url: str, text: str = "") -> str:
         if part.isdigit():
             return part
     return ""
+
+
+def _identifier_from_url(url: str, text: str = "") -> str:
+    return identifier_from_url(url, text)
+
+
+def item_page_url(url: str) -> str:
+    """Strip trailing non-numeric path segments so /item/123/extra → /item/123."""
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    parts = [part for part in parsed.path.split("/") if part]
+    last_numeric = None
+    for index, part in enumerate(parts):
+        if part.isdigit():
+            last_numeric = index
+    if last_numeric is None:
+        return raw
+    new_path = "/" + "/".join(parts[: last_numeric + 1])
+    return urlunsplit((parsed.scheme, parsed.netloc, new_path, parsed.query, parsed.fragment))
+
+
+def parse_owner_repo_id(url: str) -> Optional[Tuple[str, str, int]]:
+    """Parse owner/repo plus a later numeric id from a URL path. Site-agnostic."""
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    if parsed.scheme in {"file", "fixture"}:
+        return None
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) < 3:
+        return None
+    number = None
+    for part in parts[2:]:
+        if part.isdigit():
+            number = int(part)
+            break
+    if number is None:
+        return None
+    owner, repo = parts[0], parts[1]
+    if not owner or not repo:
+        return None
+    return owner, repo, number
 
 
 def _actors(text: str, verb: str) -> List[str]:

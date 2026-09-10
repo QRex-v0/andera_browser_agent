@@ -5,17 +5,29 @@ import json
 from pathlib import Path
 
 from andera.agent import EvidenceAgent
-from andera.list_extract import extract_schema_rows, iter_raw_records
+from andera.list_extract import (
+    RawRecord,
+    extract_schema_rows,
+    identifier_from_url,
+    item_page_url,
+    iter_raw_records,
+    parse_owner_repo_id,
+    _project_record,
+)
 from andera.models import RunStatus
 from andera.parse import parse_task
 from test_multi_target import ScriptedBrowser
 from andera.schema import (
+    column_type,
     infer_required_columns,
     infer_row_limit,
+    infer_screenshot_roles,
     infer_sort_spec,
     infer_status_filters,
     is_absolute_http_url,
+    is_identifier_column,
     is_observed_value,
+    map_detail_to_columns,
     parse_integer,
 )
 
@@ -434,6 +446,79 @@ def test_unobserved_detail_field_is_partial_not_none(agent: EvidenceAgent, tmp_p
         rows = list(csv.DictReader(handle))
     assert all(row["who reviewed"] == "" for row in rows)
     assert all("none" not in row["who reviewed"] for row in rows)
+
+
+def test_pr_hash_column_derives_identifier_from_url() -> None:
+    assert is_identifier_column("pr #")
+    assert is_identifier_column("pr#")
+    assert column_type("pr #") == "integer"
+    record = RawRecord(
+        title="Fix login",
+        url="https://host.example/acme/tools/pull/1441",
+        text="Merged by someone",
+        source_url="https://host.example/acme/tools/pulls",
+    )
+    row = _project_record(record, ["pr #", "who reviewed"])
+    assert row["pr #"] == "1441"
+    assert identifier_from_url("https://host.example/acme/tools/pull/1441/commits") == "1441"
+    assert identifier_from_url("https://host.example/item", "See #88 in the thread") == "88"
+    assert item_page_url("https://host.example/acme/tools/pull/1441/commits") == (
+        "https://host.example/acme/tools/pull/1441"
+    )
+    assert parse_owner_repo_id("https://host.example/acme/tools/pull/1441/commits") == (
+        "acme",
+        "tools",
+        1441,
+    )
+    assert parse_owner_repo_id("file:///tmp/details/101.html") is None
+
+
+def test_maps_canonical_pr_detail_keys_onto_required_columns() -> None:
+    detail = {
+        "pr_number": 12,
+        "committers": ["ann", "bob"],
+        "reviewers": ["approved: cam", "requested: eve"],
+        "merged_by": "dan",
+        "merged_at": "2026-01-01T00:00:00Z",
+        "source_urls": ["https://api.example/12"],
+    }
+    mapped = map_detail_to_columns(
+        detail, ["pr #", "who committed", "who reviewed", "who merged"]
+    )
+    assert mapped["pr #"] == "12"
+    assert mapped["who committed"] == "ann; bob"
+    assert mapped["who reviewed"] == "approved: cam; requested: eve"
+    assert mapped["who merged"] == "dan"
+    empty = map_detail_to_columns(
+        {
+            "pr_number": 13,
+            "committers": [],
+            "reviewers": [],
+            "merged_by": None,
+            "merged_at": None,
+            "source_urls": [],
+        },
+        ["pr #", "who committed", "who reviewed", "who merged"],
+    )
+    assert empty["pr #"] == "13"
+    assert empty["who committed"] == ""
+    assert empty["who reviewed"] == ""
+    assert empty["who merged"] == ""
+
+
+def test_pr_like_screenshot_roles_do_not_break_hn() -> None:
+    hn = "Take a screenshot of the top 5 stories with title, URL, and points"
+    assert infer_screenshot_roles(hn) == ["final"]
+    pr = (
+        "find the last 10 merged PRs, take a screenshot of each pull request page, "
+        "and create a CSV of PR number, who committed, who reviewed, and who merged"
+    )
+    assert infer_screenshot_roles(pr) == ["pull_request_page"]
+    home = (
+        "For Alpha, Beta, and Gamma, take a screenshot of the website, as well as a "
+        "screenshot of the most recent press/media/blog/content released by them"
+    )
+    assert infer_screenshot_roles(home) == ["homepage", "latest_content"]
 
 
 def test_ranked_list_agent_run_is_success(agent: EvidenceAgent, tmp_path: Path) -> None:

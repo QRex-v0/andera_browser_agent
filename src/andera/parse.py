@@ -81,7 +81,7 @@ def parse_task(message: str, target_url: str | None = None, timeout_ms: int | No
             "requested artifacts exist",
             "every output field has provenance",
         ],
-        step_budget=max(24 if roles else 20, 8 + 2 * row_limit),
+        step_budget=max(24 if roles else 20, 8 + (3 if "pull_request_page" in roles else 2) * row_limit),
         write_actions_allowed=False,
         row_limit=row_limit,
         screenshot_scope=infer_screenshot_scope(text) if "screenshot" in artifacts else "full_page",

@@ -13,6 +13,7 @@ from andera.schema import (
     infer_named_targets,
     infer_screenshot_roles,
     infer_screenshot_scope,
+    is_pr_like_columns,
     needs_most_recent,
     needs_answer,
     needs_screenshot,
@@ -227,7 +228,10 @@ class OpenAIPlanner:
         scope = str(payload.get("screenshot_scope") or "").strip().lower().replace("-", "_")
         if scope not in {"viewport", "full_page"}:
             scope = infer_screenshot_scope(message)
-        roles = _string_list(payload.get("screenshot_roles")) or infer_screenshot_roles(message)
+        inferred_roles = infer_screenshot_roles(message)
+        roles = _string_list(payload.get("screenshot_roles")) or inferred_roles
+        if inferred_roles == ["pull_request_page"] and "pull_request_page" not in roles:
+            roles = inferred_roles
         if timeout_ms is not None:
             resolved_timeout = int(timeout_ms)
         else:
@@ -248,7 +252,10 @@ class OpenAIPlanner:
             ),
             required_columns=required_columns,
             completion_criteria=_string_list(payload.get("completion_criteria")),
-            step_budget=max(int(payload.get("step_budget") or 24), 8 + 2 * row_limit),
+            step_budget=max(
+                int(payload.get("step_budget") or 24),
+                8 + (3 if "pull_request_page" in roles else 2) * row_limit,
+            ),
             write_actions_allowed=bool(payload.get("write_actions_allowed", False)),
             row_limit=row_limit,
             screenshot_scope=scope,
@@ -467,12 +474,23 @@ def _missing_screenshot_role(spec: TaskSpec, trajectory: Sequence[TrajectoryEven
     if "screenshot" not in spec.artifact_types:
         return ""
     roles = list(spec.screenshot_roles) or ["final"]
-    captured = {
-        str(event.args.get("role") or "final")
+    captured_events = [
+        event
         for event in trajectory
         if event.action == "screenshot" and event.outcome in {"ok", "unavailable"}
-    }
+    ]
+    pr_captured = sum(
+        1 for event in captured_events if str(event.args.get("role") or "") == "pull_request_page"
+    )
+    needed_pr = spec.row_limit if spec.row_limit > 0 else 1
+    if "pull_request_page" in roles and pr_captured < needed_pr:
+        return "pull_request_page"
+    if pr_captured >= needed_pr and spec.row_limit > 0 and is_pr_like_columns(spec.required_columns):
+        return ""
+    captured = {str(event.args.get("role") or "final") for event in captured_events}
     for role in roles:
+        if role == "pull_request_page":
+            continue
         if role not in captured:
             return role
     return ""
