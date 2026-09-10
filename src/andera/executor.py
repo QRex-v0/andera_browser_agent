@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import unquote, unquote_plus, urlparse
+from urllib.parse import urlparse
 
 from andera.evidence import EvidenceStore, extract_table_schema, extract_visible_text, sha256_hex
 from andera.html_query import node_visible_text, parse_html, query
@@ -1688,8 +1688,6 @@ def _is_bare_tag_selector(selector: str) -> bool:
     return not raw or raw in _BARE_TAG_SELECTORS
 
 
-_URL_WHITESPACE_RE = re.compile(r"\s")
-_URL_PROSE_RE = re.compile(r"[A-Za-z]{2,}\s+[A-Za-z]{2,}\s+[A-Za-z]{2,}")
 _ALLOWED_URL_SCHEMES = {"http", "https", "file", "fixture"}
 _REMOTE_URL_SCHEMES = {"http", "https"}
 _ERROR_HTTP_STATUS = {404, 410, 500, 502, 503, 504}
@@ -1718,30 +1716,15 @@ def _invalid_url_reason(url: str) -> str:
     raw = url or ""
     if not raw.strip():
         return "invalid_url"
-    if _URL_WHITESPACE_RE.search(raw):
-        return "invalid_url"
-    try:
-        decoded = unquote(raw)
-    except Exception:
-        return "invalid_url"
-    if _URL_WHITESPACE_RE.search(decoded):
-        return "invalid_url"
-    if raw.count("?") > 1 or decoded.count("?") > 1:
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in raw):
         return "invalid_url"
     parsed = urlparse(raw)
-    if not parsed.scheme:
-        return "invalid_url"
-    scheme = parsed.scheme.lower()
+    scheme = (parsed.scheme or "").lower()
     if scheme not in _ALLOWED_URL_SCHEMES:
         return "invalid_url"
     if scheme in _REMOTE_URL_SCHEMES and not parsed.netloc:
         return "invalid_url"
     if scheme in {"file", "fixture"} and not (parsed.path or parsed.netloc):
-        return "invalid_url"
-    query = parsed.query or ""
-    if query and _URL_WHITESPACE_RE.search(unquote_plus(query)):
-        return "invalid_url"
-    if _URL_PROSE_RE.search(f"{unquote(parsed.path or '')} {unquote_plus(query)}"):
         return "invalid_url"
     return ""
 

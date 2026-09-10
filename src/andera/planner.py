@@ -86,7 +86,7 @@ Do not invent field values. Do not write none/unknown for a field that was not o
 If a field is ambiguous, keep the ambiguity visible in the output instead of silently choosing one interpretation.
 When a download is required for a dated filing or report, use a download action with selector and text filters (match_text/match_date) that disambiguate the target before click.
 When evidence is collected, emit done_subgoal. If extract_table or extract_list already ran, emit done_subgoal instead of extracting again. If answer is required, do not done_subgoal until answer has been written.
-A url must be a single parseable URL. Do not include commentary, whitespace, or a second question mark.
+A url must be a single parseable http(s) URL: scheme, host, and no raw whitespace or commentary. Percent-encoding and "+" in a query string are valid.
 Return JSON only.
 """
 

@@ -12,8 +12,11 @@ from test_multi_target import ScriptedBrowser
 
 
 PROSE_URL = (
-    "https://www.example.test/releases/updates?"
-    "%20Nope%20should%20be%20/releases?%20Wait%20JSON%20only%20no%20comments."
+    "https://www.example.test/releases/updates? "
+    "Nope should be /releases? Wait JSON only no comments."
+)
+GITHUB_SEARCH = (
+    "https://github.com/openclaw/openclaw/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-desc+"
 )
 
 
@@ -45,11 +48,12 @@ class ScriptedFlow:
         return BrowserAction("done_subgoal", {})
 
 
-def test_invalid_url_reason_refuses_prose_and_second_question_mark() -> None:
+def test_invalid_url_reason_refuses_raw_prose_not_encoded_queries() -> None:
     assert _invalid_url_reason("https://www.example.test/releases") == ""
     assert _invalid_url_reason("https://www.example.test/releases?topic=updates") == ""
+    assert _invalid_url_reason(GITHUB_SEARCH) == ""
     assert _invalid_url_reason(PROSE_URL) == "invalid_url"
-    assert _invalid_url_reason("https://www.example.test/path?foo=1?bar=2") == "invalid_url"
+    assert _invalid_url_reason("https://www.example.test/path?foo=1?bar=2") == ""
     assert _invalid_url_reason("https://www.example.test/path?foo=bar baz") == "invalid_url"
     assert _invalid_url_reason("/releases") == "invalid_url"
     assert _invalid_url_reason("") == "invalid_url"
@@ -69,7 +73,7 @@ def test_error_page_kind_reads_title_and_status() -> None:
     assert _error_page_kind("<html><body>ok</body></html>", 404) == "not_found"
     assert _error_page_kind("<html><body>ok</body></html>", 500) == "error_page"
     assert _error_page_kind("<html><title>What is a 404 error?</title><body><p>A long article about status codes and recovery.</p></body></html>") == ""
-    assert "single parseable URL" in DECIDE_INSTRUCTIONS
+    assert "single parseable http(s) URL" in DECIDE_INSTRUCTIONS
 
 
 def test_glued_prose_url_is_rejected_and_never_loaded(tmp_path: Path, out_dir: Path) -> None:

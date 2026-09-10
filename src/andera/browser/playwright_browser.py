@@ -1,13 +1,48 @@
 from __future__ import annotations
 
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 import re
-from typing import Any
+import time
+from typing import Any, Dict
+from urllib.parse import urlparse
 
 from andera.env import declared_user_agent
 
 SETUP_COMMAND = "make setup"
 _DECLARED_ACCEPT_ENCODING = "gzip, deflate"
+MIN_HOST_INTERVAL_S = 1.0
+
+
+def host_of(url: str) -> str:
+    return (urlparse(url or "").hostname or "").lower()
+
+
+def retry_after_seconds(value: str, now: float | None = None) -> float:
+    raw = (value or "").strip()
+    if not raw:
+        return 0.0
+    if raw.isdigit():
+        return float(raw)
+    try:
+        parsed = parsedate_to_datetime(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        wall = time.time() if now is None else now
+        return max(0.0, parsed.timestamp() - wall)
+    except Exception:
+        return 0.0
+
+
+def next_host_wait(
+    last_request_at: float,
+    retry_until: float,
+    now: float,
+    interval_s: float = MIN_HOST_INTERVAL_S,
+) -> float:
+    earliest = max(retry_until, last_request_at + max(0.0, interval_s))
+    return max(0.0, earliest - now)
 
 
 class PlaywrightBrowser:
@@ -47,6 +82,8 @@ class PlaywrightBrowser:
             self._context = self._browser.new_context(**self._context_kwargs())
             self._page = self._context.new_page()
             self._last_http_status = 0
+            self._last_host_at: Dict[str, float] = {}
+            self._retry_until: Dict[str, float] = {}
         except Exception as exc:
             self._playwright_cm.__exit__(None, None, None)
             message = str(exc)
@@ -59,15 +96,54 @@ class PlaywrightBrowser:
             ) from None
 
     def goto(self, url: str) -> None:
+        self._pace(url)
         response = self._page.goto(url, wait_until="domcontentloaded")
         try:
             self._last_http_status = int(response.status) if response is not None else 0
         except Exception:
             self._last_http_status = 0
+        self._note_retry_after(url, response)
         try:
             self._page.wait_for_load_state("load", timeout=15000)
         except Exception:
             pass
+
+    def _pace(self, url: str) -> None:
+        host = host_of(url)
+        if not host:
+            return
+        now = time.monotonic()
+        wait = next_host_wait(
+            self._last_host_at.get(host, 0.0),
+            self._retry_until.get(host, 0.0),
+            now,
+        )
+        if wait > 0:
+            try:
+                self._page.wait_for_timeout(int(wait * 1000))
+            except Exception:
+                time.sleep(wait)
+        self._last_host_at[host] = time.monotonic()
+
+    def _note_retry_after(self, url: str, response: Any) -> None:
+        host = host_of(url)
+        if not host or response is None:
+            return
+        headers = {}
+        try:
+            headers = dict(response.headers or {})
+        except Exception:
+            headers = {}
+        retry = ""
+        for key, value in headers.items():
+            if str(key).lower() == "retry-after":
+                retry = str(value or "")
+                break
+        if not retry:
+            return
+        wait = retry_after_seconds(retry)
+        if wait > 0:
+            self._retry_until[host] = time.monotonic() + wait
 
     def last_http_status(self) -> int:
         return int(self._last_http_status or 0)
@@ -111,6 +187,7 @@ class PlaywrightBrowser:
             }
 
     def click(self, selector: str, match_text: str = "") -> None:
+        self._pace(self._page.url)
         if match_text:
             target = self._page.locator(selector or "a, button").filter(has_text=match_text)
             target.first.click(timeout=5000)
@@ -140,6 +217,7 @@ class PlaywrightBrowser:
     ) -> str:
         destination = Path(destination_dir)
         destination.mkdir(parents=True, exist_ok=True)
+        self._pace(self._page.url)
         locator = self._page.locator(selector)
         count = locator.count()
         if count == 0:
