@@ -343,10 +343,6 @@ class OpenAIPlanner:
                 date_value = _infer_match_date(spec.raw)
                 if date_value:
                     args["match_date"] = date_value
-            if "match_text" not in args:
-                text_value = _infer_match_text(spec.raw)
-                if text_value:
-                    args["match_text"] = text_value
         return BrowserAction(action_type, args)
 
     def _complete(self, instructions: str, payload: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -703,15 +699,6 @@ def _infer_match_date(text: str) -> str:
         return match.group(0).strip()
     match = re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", text)
     return match.group(0) if match else ""
-
-
-def _infer_match_text(text: str) -> str:
-    lowered = text.lower()
-    if "8-k" in lowered:
-        return "8-k"
-    if "8-k" in lowered.replace(" ", ""):
-        return "8-k"
-    return ""
 
 
 def _rule_answer(task: str, material: str) -> str:
