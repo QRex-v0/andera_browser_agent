@@ -19,7 +19,15 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run", help="Execute one evidence-collection task")
     run.add_argument("task", help="Natural-language evidence task")
     run.add_argument("--url", help="Override target URL or local HTML path")
-    run.add_argument("--browser", choices=("fixture", "playwright"), default=None)
+    run.add_argument(
+        "--browser",
+        choices=("fixture", "playwright", "hosted"),
+        default=None,
+        help=(
+            "Browser backend. Defaults to the pinned local Chromium; 'hosted' is "
+            "opt-in and runs against a remote, human-authenticated profile."
+        ),
+    )
     run.add_argument("--planner", choices=("openai", "rule"), default="openai")
     run.add_argument("--out", default="runs", help="Directory for artifacts and result.json")
     run.add_argument("--timeout-ms", type=int, default=None, help="Selector wait timeout")
