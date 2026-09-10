@@ -29,7 +29,7 @@ def yc_outreach_rows(*, companies_limit: int = 5) -> List[Dict[str, str]]:
         for founder in company.get("founders") or []:
             founder_name = str(founder.get("full_name") or "").strip()
             linkedin = canonical_linkedin_profile_url(str(founder.get("linkedin_url") or ""))
-            email = generate_founder_outreach_email(_facts_for_founder(company, founder)).body
+            email = _email_for_founder(company, founder)
             rows.append(
                 {
                     "founder name": founder_name,
@@ -92,6 +92,35 @@ def _facts_for_founder(company: Dict[str, Any], founder: Dict[str, Any]) -> List
         CollectedFact("yc-founder-role", "founder_role", str(founder.get("title") or "Founder"), source_url=source),
         CollectedFact("yc-batch", "yc_batch", str(company.get("batch_name") or company.get("batch") or ""), source_url=source),
     ]
+
+
+def _email_for_founder(company: Dict[str, Any], founder: Dict[str, Any]) -> str:
+    email = generate_founder_outreach_email(_facts_for_founder(company, founder)).body
+    sentence = _company_description_sentence(company)
+    if not sentence:
+        return email
+    lines = email.splitlines()
+    insert_at = 1 if lines else 0
+    return "\n".join(lines[:insert_at] + ["", sentence] + lines[insert_at:])
+
+
+def _company_description_sentence(company: Dict[str, Any]) -> str:
+    name = str(company.get("name") or "").strip()
+    one_liner = str(company.get("one_liner") or "").strip().rstrip(".")
+    if not name or not one_liner:
+        return ""
+    return f"I saw that {name} works on {_sentence_object(one_liner)}."
+
+
+def _sentence_object(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    for article in ("A", "An", "The"):
+        prefix = f"{article} "
+        if cleaned.startswith(prefix):
+            return article.lower() + cleaned[len(article) :]
+    if cleaned.startswith("Tools "):
+        return "tools " + cleaned[len("Tools ") :]
+    return cleaned
 
 
 def _algolia_opts() -> Dict[str, str]:
