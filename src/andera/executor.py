@@ -142,7 +142,7 @@ def execute(
     def remaining_ms() -> int:
         return max(0, spec.timeout_ms - int((time.monotonic() - started) * 1000))
 
-    def digest_for(page_html: str) -> str:
+    def digest_for(page_html: str) -> str:  # Avoid loop
         payload = f"{browser.current_url()}\n{page_html}".encode("utf-8", errors="replace")
         return hashlib.sha256(payload).hexdigest()
 
@@ -176,6 +176,7 @@ def execute(
                 pass
         return _with_focus(observation_from_html(browser.current_url() or spec.target_url, page_html), focus)
 
+    # Agent loop is here: observe → decide → act
     while len(trajectory) < spec.step_budget:
         if remaining_ms() <= 0:
             errors.append(Issue("timeout", "Exceeded time budget", retryable=True))
@@ -1909,6 +1910,7 @@ def _needs_page_detail(columns: List[str]) -> bool:
     return any(is_detail_field(name) for name in columns)
 
 
+# Stop "write" actions
 def classify_risk(action_type: str, label: str = "") -> str:
     if action_type in {
         "navigate",

@@ -28,6 +28,7 @@ from andera.schema import (
 _EVIDENCE_ARTIFACT_TYPES = {"screenshot", "html_snapshot", "csv", "download", "text_extract", "answer"}
 
 
+# Isolated (no CoT, message history), no LLM calls (avoided LLM-as-judge in this phase)
 def verify(spec: TaskSpec, outcome: ExecutionOutcome, provenance: Optional[Dict] = None) -> VerifierReport:
     """Independent checks. May downgrade a status, never upgrade it."""
     checks: List[VerifierCheck] = []

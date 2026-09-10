@@ -22,6 +22,9 @@ from andera.schema import (
 )
 from andera.targets import official_homepage
 
+
+# "tool calling": not doing function calling (but we can), used structured output to force the model to execute
+# additionalProperties: False + strict: True: reject schema violations
 ALLOWED_ACTIONS = (
     "navigate",
     "inspect",
@@ -359,6 +362,7 @@ class OpenAIPlanner:
         return parsed
 
 
+# Agent Harness: no harness, need full control
 class ResponsesClient:
     endpoint = "https://api.openai.com/v1/responses"
 
